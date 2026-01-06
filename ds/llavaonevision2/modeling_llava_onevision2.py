@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 from torch.nn import LayerNorm
 
 from transformers import AutoModel
-from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ModelOutput
@@ -220,8 +219,13 @@ class VisionRotaryEmbedding(nn.Module):
 
 class LlavaViTEmbeddings(nn.Module):
     """
-    Patch embedding layer that converts images to patch embeddings.
-    Supports both 4D (B, C, H, W) and 5D (B, C, T, H, W) inputs.
+    Patch embedding layer that converts pre-processed patches to embeddings.
+
+    This module is designed to receive patches that have already been extracted
+    and arranged by the Qwen2VL image processor in 2x2 block spatial order.
+
+    Input format: [total_patches, num_channels, patch_size, patch_size]
+    Output format: [total_patches, embed_dim]
     """
 
     def __init__(self, config: LlavaOnevision2VisionConfig):
@@ -230,6 +234,7 @@ class LlavaViTEmbeddings(nn.Module):
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
         self.patch_size = config.patch_size
+        self.in_channels = config.num_channels
 
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
@@ -239,26 +244,12 @@ class LlavaViTEmbeddings(nn.Module):
             bias=False,
         )
 
-    def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.FloatTensor) -> torch.Tensor:
         target_dtype = self.patch_embedding.weight.dtype
-        # Handle 4D (B, C, H, W) or 5D (B, C, T, H, W) inputs
-        if pixel_values.dim() == 4:
-            pixel_values = pixel_values.unsqueeze(2)  # (B, C, 1, H, W)
+        hidden_states = hidden_states.view(-1, self.in_channels, self.patch_size, self.patch_size)
+        hidden_states = self.patch_embedding(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
 
-        batch_size, channels, t_frames, height, width = pixel_values.shape
-
-        # Merge time into batch for Conv2d
-        x_2d = pixel_values.permute(0, 2, 1, 3, 4).reshape(batch_size * t_frames, channels, height, width)
-
-        # Patch Embed
-        embeddings = self.patch_embedding(x_2d.to(dtype=target_dtype))  # (B*T, C, Hp, Wp)
-        embeddings = embeddings.flatten(2).transpose(1, 2)  # (B*T, L_frame, C)
-
-        # Flatten all patches
-        total_patches = t_frames * (height // self.patch_size) * (width // self.patch_size)
-        embeddings = embeddings.reshape(batch_size, total_patches, self.embed_dim)
-
-        return embeddings
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +260,9 @@ class LlavaViTEmbeddings(nn.Module):
 class LlavaOnevision2VisionPatchMerger(nn.Module):
     """
     Patch merger that merges spatial_merge_size x spatial_merge_size patches into one.
-    Supports both packing format and standard batch format.
+
+    This module is designed to work with Qwen2VL-style patch processing where patches
+    are already arranged in 2x2 block order by the image processor.
     """
 
     def __init__(
@@ -289,123 +282,24 @@ class LlavaOnevision2VisionPatchMerger(nn.Module):
         )
         self.spatial_merge_size = spatial_merge_size
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        grid_thw: Optional[torch.Tensor] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Merge patches with support for both packing and batch formats.
+        Merge patches from Qwen2VL-style input.
 
-        Packing format:
-            Input: [total_seq_len, hidden_size] with grid_thw defining sample boundaries
-            Output: [total_merged_seq_len, dim]
+        The input patches are already arranged in 2x2 block order by the image processor,
+        so we simply need to apply LayerNorm, reshape, and project through MLP.
 
-        Batch format:
-            Input: [B, N, C] where N = H * W
-            Output: [B, N // (spatial_merge_size^2), dim]
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, hidden_size] or [seq_len, hidden_size]
+               where seq_len = t * h * w (patches in 2x2 block order)
+
+        Returns:
+            Merged tensor of shape [batch_size, seq_len // spatial_merge_size^2, dim]
+            or [seq_len // spatial_merge_size^2, dim]
         """
-        merge_size = self.spatial_merge_size
-
-        # ============================================================
-        # 【PACKING FORMAT】: Input is [seq_len, C] with grid_thw
-        # ============================================================
-        if grid_thw is not None and x.dim() == 2:
-            x = self.ln_q(x)
-
-            all_merged = []
-            start_idx = 0
-
-            for sample_thw in grid_thw:
-                t, h, w = sample_thw[0].item(), sample_thw[1].item(), sample_thw[2].item()
-                seq_len = t * h * w
-                sample_x = x[start_idx : start_idx + seq_len]  # [t*h*w, C]
-
-                # Validate divisibility
-                assert (
-                    h % merge_size == 0 and w % merge_size == 0
-                ), f"Grid size ({h}, {w}) not divisible by merge_size {merge_size}"
-
-                C = sample_x.shape[-1]
-                new_h = h // merge_size
-                new_w = w // merge_size
-
-                # Reshape: [t*h*w, C] -> [t, h, w, C]
-                sample_x = sample_x.view(t, h, w, C)
-
-                # Merge 2x2 spatial patches
-                # [t, h, w, C] -> [t, new_h, merge_size, new_w, merge_size, C]
-                sample_x = sample_x.view(t, new_h, merge_size, new_w, merge_size, C)
-                sample_x = sample_x.permute(
-                    0, 1, 3, 2, 4, 5
-                ).contiguous()  # [t, new_h, new_w, merge_size, merge_size, C]
-                sample_x = sample_x.view(
-                    t * new_h * new_w, merge_size * merge_size * C
-                )  # [t*new_h*new_w, hidden_size]
-
-                all_merged.append(sample_x)
-                start_idx += seq_len
-
-            merged_x = torch.cat(all_merged, dim=0)  # [total_merged_seq_len, hidden_size]
-            return self.mlp(merged_x)
-
-        # ============================================================
-        # 【BATCH FORMAT】: Input is [B, N, C]
-        # ============================================================
-        B, N, C = x.size()
-
-        # Infer H and W if not provided
-        if height is None or width is None:
-            H, W = self._infer_hw(N)
-        else:
-            H, W = height, width
-
-        assert H * W == N, f"Height {H} * Width {W} != N {N}"
-
-        # Validate divisibility by merge_size
-        assert (
-            H % merge_size == 0 and W % merge_size == 0
-        ), f"Grid size ({H}, {W}) not divisible by merge_size {merge_size}"
-
-        # Apply LayerNorm
-        x = self.ln_q(x)
-
-        # Reshape to (B, H, W, C)
-        x = x.view(B, H, W, C)
-
-        # Merge 2x2 spatial patches
-        new_H = H // merge_size
-        new_W = W // merge_size
-        x = x.view(B, new_H, merge_size, new_W, merge_size, C)
-        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()  # (B, new_H, new_W, merge_size, merge_size, C)
-        x = x.view(B, new_H * new_W, merge_size * merge_size * C)  # (B, N', hidden_size)
-
-        # Project to LLM dimension
+        x = self.ln_q(x).view(-1, self.hidden_size)
         x = self.mlp(x)
         return x
-
-    def _infer_hw(self, N: int) -> Tuple[int, int]:
-        """Infer height and width from number of patches."""
-        merge_size = self.spatial_merge_size
-        sqrt_n = int(N**0.5)
-
-        # Try to find factors closest to square
-        for h in range(sqrt_n, 0, -1):
-            if N % h == 0:
-                w = N // h
-                if h % merge_size == 0 and w % merge_size == 0:
-                    return h, w
-
-        # Fallback: try all factors
-        for h in range(1, N + 1):
-            if N % h == 0:
-                w = N // h
-                if h % merge_size == 0 and w % merge_size == 0:
-                    return h, w
-
-        raise ValueError(f"Cannot find valid H, W for N={N} with merge_size={merge_size}")
 
 
 def rotate_half(x):
@@ -443,6 +337,50 @@ def apply_rotary_pos_emb(q, k, freqs):
     k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
 
+def convert_rope_to_block_layout(
+    freqs: torch.Tensor, t: int, h: int, w: int, spatial_merge_size: int = 2
+) -> torch.Tensor:
+    """
+    Convert RoPE from row-major order (1x1 layout) to 2x2 block layout.
+
+    The image processor arranges patches in 2x2 blocks when spatial_merge_size=2:
+    - Row-major order: [p(0,0), p(0,1), p(0,2), p(0,3), ..., p(1,0), p(1,1), ...]
+    - Block order: [p(0,0), p(0,1), p(1,0), p(1,1)], [p(0,2), p(0,3), p(1,2), p(1,3)], ...
+
+    Args:
+        freqs: RoPE frequencies in row-major order, shape [t*h*w, half]
+        t: temporal dimension
+        h: height (unmerged patch count)
+        w: width (unmerged patch count)
+        spatial_merge_size: size of spatial merge blocks (default: 2)
+
+    Returns:
+        torch.Tensor: RoPE frequencies in 2x2 block order, same shape [t*h*w, half]
+    """
+    sms = spatial_merge_size
+    if sms == 1:
+        return freqs
+
+    half = freqs.shape[-1]
+
+    # freqs shape: [t*h*w, half]
+    # Reshape to [t, h, w, half]
+    freqs = freqs.view(t, h, w, half)
+
+    # Calculate merged dimensions
+    h_merged = h // sms
+    w_merged = w // sms
+
+    # Reshape to [t, h_merged, sms, w_merged, sms, half]
+    freqs = freqs.view(t, h_merged, sms, w_merged, sms, half)
+
+    # Permute to [t, h_merged, w_merged, sms_h, sms_w, half] - 2x2 block order
+    freqs = freqs.permute(0, 1, 3, 2, 4, 5).contiguous()
+
+    # Reshape back to [t*h*w, half]
+    freqs = freqs.view(t * h * w, half)
+
+    return freqs
 
 class LlavaViTFlashAttention2(nn.Module):
     """
@@ -471,7 +409,7 @@ class LlavaViTFlashAttention2(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass using Flash Attention 2.
         """
@@ -539,7 +477,7 @@ class LlavaViTEncoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
 
@@ -576,7 +514,7 @@ class LlavaViTEncoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-    ) -> Union[Tuple, BaseModelOutput]:
+    ) -> Union[tuple, BaseModelOutput]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
@@ -677,10 +615,8 @@ class LlavaOnevision2PreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         super()._init_weights(module)
-        if isinstance(module, LlavaOnevision2VisionPretrainedModel):
-            std_cls = float(module.config.hidden_size) ** -0.5
-            # torch.nn.init.normal_(module.class_embedding, mean=0.0, std=std_cls)
-            # torch.nn.init.normal_(module.class_pos_emb, mean=0.0, std=std_cls)
+        # Custom weight initialization can be added here if needed
+        # For LlavaOnevision2VisionPretrainedModel, we rely on default initialization
 
 
 class Siglip2MultiheadAttentionPoolingHead(nn.Module):
@@ -724,7 +660,6 @@ def interpolate_frame_indices(
         interpolated_indices: [B, seq_len] Interpolated frame indices, range in [0, target_frames-1]
     """
     bs, seq_len = frame_indices.shape
-    device = frame_indices.device
 
     # Convert total_frames to float for interpolation calculation
     total_frames_float = total_frames.float().view(bs, 1)  # [B, 1]
@@ -814,10 +749,14 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
     """
     LLaVA-OneVision 2.0 Vision Model.
 
-    Supports:
-        - 4D input: [B, C, H, W] for images
-        - 5D input: [B, C, T, H, W] for videos
-        - visible_indices for sparse patch selection
+    This vision model is designed to work with Qwen2VL-style image processing:
+        - Receives pre-processed patches in 2x2 block spatial order
+        - Applies RoPE with matching 2x2 block layout conversion
+        - Supports visible_indices for sparse patch selection (video)
+
+    Input format:
+        hidden_state: [total_patches, num_channels, patch_size, patch_size]
+        grid_thw: [num_samples, 3] with [t, h, w] for each sample
     """
 
     def __init__(self, config: LlavaOnevision2VisionConfig):
@@ -850,28 +789,34 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
     @replace_return_docstrings(output_type=BaseModelOutputWithPooling, config_class=LlavaOnevision2VisionConfig)
     def forward(
         self,
-        pixel_values: torch.Tensor,
+        hidden_state: torch.Tensor,
         grid_thw: Optional[torch.Tensor] = None,
         visible_indices: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         skip_merger: Optional[bool] = False,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+    ) -> Union[tuple, BaseModelOutputWithPooling]:
         r"""
         Forward pass for vision model.
 
+        This method accepts pre-processed patches from Qwen2VL image processor and applies
+        RoPE (Rotary Position Embedding) in 2x2 block layout to match the spatial arrangement
+        of patches.
+
         Args:
-            pixel_values: 4D [B, C, H, W] or 5D [B, C, T, H, W] tensor
-            grid_thw: Optional grid sizes for each sample
-            visible_indices: Optional indices for sparse patch selection (for video)
-            output_attentions: Whether to return attention weights
-            output_hidden_states: Whether to return all hidden states
-            return_dict: Whether to return a ModelOutput instead of tuple
-            skip_merger: If True, skip patch merger
+            hidden_state: Pre-processed patches from Qwen2VL processor.
+                Shape: [total_patches, num_channels, patch_size, patch_size]
+            grid_thw: Grid sizes tensor of shape [num_samples, 3] with [t, h, w] for each sample.
+                Required for computing RoPE and handling visible indices.
+            visible_indices: Optional indices for sparse patch selection (for video).
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+            return_dict: Whether to return a ModelOutput instead of tuple.
+            skip_merger: If True, skip patch merger (useful for consistency checking).
 
         Returns:
-            BaseModelOutputWithPooling with last_hidden_state
+            BaseModelOutputWithPooling with last_hidden_state containing merged features.
         """
         output_attentions = (
             output_attentions if output_attentions is not None else getattr(self.config, "output_attentions", False)
@@ -883,41 +828,37 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else getattr(self.config, "use_return_dict", True)
 
-        # Handle special case for video input
-        if pixel_values.shape[0] == 8 and pixel_values.dim() == 4:
-            # [8, C, H, W] -> [1, C, 8, H, W]
-            pixel_values = pixel_values.unsqueeze(0).permute(0, 2, 1, 3, 4)
+        batch_size = grid_thw.size(0)
+        assert batch_size == 1, "Currently only batch_size=1 is supported."
 
         # Determine video dimensions for RoPE
-        if pixel_values.dim() == 5:
-            t_frames = pixel_values.shape[2]
-            height = pixel_values.shape[3]
-            width = pixel_values.shape[4]
-        else:
-            t_frames = 1
-            height = pixel_values.shape[2]
-            width = pixel_values.shape[3]
+        t_frames = grid_thw[0, 0].item()
+        height = grid_thw[0, 1].item()
+        width = grid_thw[0, 2].item()
 
         # 1. Embeddings
-        hidden_states = self.embeddings(pixel_values)
+        # Note: embeddings returns [total_patches, embed_dim], we need to add batch dimension
+        hidden_states = self.embeddings(hidden_state)
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)  # [1, total_patches, embed_dim]
         batch_size, total_patches, _ = hidden_states.shape
 
         # 2. Visible Indices Handling
         if visible_indices is None or (isinstance(visible_indices, list) and visible_indices[0] is None):
             if t_frames == 1:
                 visible_indices = (
-                    torch.arange(total_patches, device=pixel_values.device).unsqueeze(0).expand(batch_size, -1)
+                    torch.arange(total_patches, device=hidden_state.device).unsqueeze(0).expand(batch_size, -1)
                 )
             else:
                 # Compute interpolated frame indices for video
-                frame_indices = torch.arange(t_frames).unsqueeze(0).to(pixel_values.device)
-                total_frames_tensor = torch.tensor([t_frames]).to(pixel_values.device)
+                frame_indices = torch.arange(t_frames).unsqueeze(0).to(hidden_state.device)
+                total_frames_tensor = torch.tensor([t_frames]).to(hidden_state.device)
                 interpolated_indices = interpolate_frame_indices(frame_indices, total_frames_tensor, 64)
                 visible_indices = compute_patch_positions_with_interpolated_temporal(
                     interpolated_indices,
-                    height // self.config.patch_size,
-                    width // self.config.patch_size,
-                    pixel_values.device,
+                    height,
+                    width,
+                    hidden_state.device,
                 )
         else:
             # Handle visible_indices as list
@@ -925,7 +866,7 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
                 if len(visible_indices) == 1:
                     visible_indices = visible_indices[0]
                     if not isinstance(visible_indices, torch.Tensor):
-                        visible_indices = torch.tensor(visible_indices, device=pixel_values.device)
+                        visible_indices = torch.tensor(visible_indices, device=hidden_state.device)
                     if visible_indices.dim() == 1:
                         visible_indices = visible_indices.unsqueeze(0)
                 else:
@@ -933,9 +874,9 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
                         [v if isinstance(v, torch.Tensor) else torch.tensor(v) for v in visible_indices]
                     )
             elif not isinstance(visible_indices, torch.Tensor):
-                visible_indices = torch.tensor(visible_indices, device=pixel_values.device)
+                visible_indices = torch.tensor(visible_indices, device=hidden_state.device)
 
-            visible_indices = visible_indices.to(pixel_values.device)
+            visible_indices = visible_indices.to(hidden_state.device)
 
         # Gather visible patches for images (t_frames == 1)
         if t_frames == 1:
@@ -943,16 +884,20 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
             hidden_states = torch.gather(hidden_states, 1, gather_index)
 
         # 3. RoPE Construction
+        # Generate RoPE in row-major order, then convert to block layout to match Qwen2VL input
         freqs_full = self.video_rope.forward_with_thw(
             t=64 if t_frames > 1 else 1,
-            h=height // self.config.patch_size,
-            w=width // self.config.patch_size,
-            device=pixel_values.device,
+            h=height,
+            w=width,
+            device=hidden_state.device,
         )
-        freqs_visible = freqs_full[visible_indices]
+
+        # Convert RoPE from row-major to block layout (matching Qwen2VL processor output)
+        # Must be done BEFORE indexing with visible_indices
+        freqs_full_block = convert_rope_to_block_layout(freqs_full, 1 if t_frames == 1 else 64, height, width, spatial_merge_size=2).unsqueeze(0)
 
         # Concatenate D/2 + D/2 -> D for applying rope
-        freqs_visible = torch.cat([freqs_visible, freqs_visible], dim=-1)
+        freqs_visible = torch.cat([freqs_full_block, freqs_full_block], dim=-1)
 
         # 4. Pre-Norm & Encoder
         hidden_states = self.layernorm_pre(hidden_states)
@@ -993,15 +938,8 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
                 attentions=encoder_outputs.attentions if output_attentions else None,
             )
 
-        # Compute grid_thw for merger
-        h_patches = height // self.config.patch_size
-        w_patches = width // self.config.patch_size
-        grid_thw = torch.tensor(
-            [[t_frames, h_patches, w_patches]] * batch_size, dtype=torch.long, device=pixel_values.device
-        )
-
-        # Patch merger (batch format)
-        merged_output = self.merger(sequence_output, grid_thw=None, height=h_patches, width=w_patches)
+        # Patch merger: input patches are already in 2x2 block order from Qwen2VL processor
+        merged_output = self.merger(sequence_output)
 
         if not return_dict:
             return (merged_output,) + (encoder_outputs.hidden_states if output_hidden_states else None,)
@@ -1012,156 +950,6 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
             hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
             attentions=encoder_outputs.attentions if output_attentions else None,
         )
-
-    def forward_debug(
-        self,
-        pixel_values: torch.Tensor,
-        grid_thw: Optional[torch.Tensor] = None,
-        visible_indices: Optional[torch.Tensor] = None,
-    ) -> dict:
-        """
-        Debug forward pass that captures intermediate states for layer-by-layer comparison.
-
-        This method is useful for debugging and verifying consistency with other implementations
-        (e.g., Megatron-LM). It captures outputs at each stage of the forward pass.
-
-        Args:
-            pixel_values: 4D [B, C, H, W] or 5D [B, C, T, H, W] tensor
-            grid_thw: Optional grid sizes for each sample
-            visible_indices: Optional indices for sparse patch selection
-
-        Returns:
-            dict: Dictionary containing intermediate outputs at each stage:
-                - "after_patch_embed": Embeddings after patch projection
-                - "after_visible_gather": Embeddings after gathering visible patches
-                - "rotary_pos_emb": Rotary position embeddings
-                - "after_pre_layernorm": Embeddings after pre-layernorm
-                - "layer_outputs": Dict mapping layer index to layer output
-                - "final_encoder_output": Output after all encoder layers
-                - "after_post_layernorm": Output after post-layernorm (if exists)
-                - "after_merger": Output after patch merger
-        """
-        output = {}
-
-        # Store input for consistency checking
-        output["input_pixel_values"] = pixel_values.clone()
-        if grid_thw is not None:
-            output["input_grid_thw"] = grid_thw.clone()
-
-        # Handle special case for video input
-        if pixel_values.shape[0] == 8 and pixel_values.dim() == 4:
-            pixel_values = pixel_values.unsqueeze(0).permute(0, 2, 1, 3, 4)
-
-        # Determine video dimensions for RoPE
-        if pixel_values.dim() == 5:
-            t_frames = pixel_values.shape[2]
-            height = pixel_values.shape[3]
-            width = pixel_values.shape[4]
-        else:
-            t_frames = 1
-            height = pixel_values.shape[2]
-            width = pixel_values.shape[3]
-
-        # 1. Embeddings
-        hidden_states = self.embeddings(pixel_values)
-        batch_size, total_patches, _ = hidden_states.shape
-        output["after_patch_embed"] = hidden_states.clone()
-
-        # 2. Visible Indices Handling
-        if visible_indices is None or (isinstance(visible_indices, list) and visible_indices[0] is None):
-            if t_frames == 1:
-                visible_indices = (
-                    torch.arange(total_patches, device=pixel_values.device).unsqueeze(0).expand(batch_size, -1)
-                )
-            else:
-                frame_indices = torch.arange(t_frames).unsqueeze(0).to(pixel_values.device)
-                total_frames_tensor = torch.tensor([t_frames]).to(pixel_values.device)
-                interpolated_indices = interpolate_frame_indices(frame_indices, total_frames_tensor, 64)
-                visible_indices = compute_patch_positions_with_interpolated_temporal(
-                    interpolated_indices,
-                    height // self.config.patch_size,
-                    width // self.config.patch_size,
-                    pixel_values.device,
-                )
-        else:
-            if isinstance(visible_indices, list):
-                if len(visible_indices) == 1:
-                    visible_indices = visible_indices[0]
-                    if not isinstance(visible_indices, torch.Tensor):
-                        visible_indices = torch.tensor(visible_indices, device=pixel_values.device)
-                    if visible_indices.dim() == 1:
-                        visible_indices = visible_indices.unsqueeze(0)
-                else:
-                    visible_indices = torch.stack(
-                        [v if isinstance(v, torch.Tensor) else torch.tensor(v) for v in visible_indices]
-                    )
-            elif not isinstance(visible_indices, torch.Tensor):
-                visible_indices = torch.tensor(visible_indices, device=pixel_values.device)
-            visible_indices = visible_indices.to(pixel_values.device)
-
-        # Gather visible patches for images
-        if t_frames == 1:
-            gather_index = visible_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
-            hidden_states = torch.gather(hidden_states, 1, gather_index)
-        output["after_visible_gather"] = hidden_states.clone()
-
-        # 3. RoPE Construction
-        freqs_full = self.video_rope.forward_with_thw(
-            t=64 if t_frames > 1 else 1,
-            h=height // self.config.patch_size,
-            w=width // self.config.patch_size,
-            device=pixel_values.device,
-        )
-        freqs_visible = freqs_full[visible_indices]
-        output["rotary_pos_emb"] = freqs_visible.clone()
-        freqs_visible = torch.cat([freqs_visible, freqs_visible], dim=-1)
-
-        # 4. Pre-Norm
-        hidden_states = self.layernorm_pre(hidden_states)
-        output["after_pre_layernorm"] = hidden_states.clone()
-
-        # 5. Encoder layers (capture each layer input and output)
-        output["layer_outputs"] = {}
-        for layer_idx, layer in enumerate(self.encoder.layers):
-            # Save input to this layer
-            output["layer_outputs"][f"layer_{layer_idx}_input"] = hidden_states.clone()
-
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=None,
-                rotary_pos_emb=freqs_visible,
-                output_attentions=False,
-            )
-            hidden_states = layer_outputs[0]
-
-            # Save output of this layer
-            output["layer_outputs"][f"layer_{layer_idx}_output"] = hidden_states.clone()
-
-        output["final_encoder_output"] = hidden_states.clone()
-
-        # 6. Use second-to-last layer output for merger (matching forward behavior)
-        num_layers = len(self.encoder.layers)
-        if num_layers >= 2:
-            hidden_states_for_merger = output["layer_outputs"][f"layer_{num_layers - 1}_output"]
-        else:
-            hidden_states_for_merger = hidden_states
-
-        # Save output before adapter/merger (for consistency with Megatron model)
-        output["before_adapter"] = hidden_states_for_merger.clone()
-
-        # 7. Post-Norm (if exists)
-        if self.layernorm_post is not None:
-            hidden_states_for_merger = self.layernorm_post(hidden_states_for_merger)
-            output["after_post_layernorm"] = hidden_states_for_merger.clone()
-
-        # 8. Merger
-        h_patches = height // self.config.patch_size
-        w_patches = width // self.config.patch_size
-        merged_output = self.merger(hidden_states_for_merger, grid_thw=None, height=h_patches, width=w_patches)
-        output["after_merger"] = merged_output.clone()
-
-        return output
-
 
 @auto_docstring
 class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
@@ -1198,16 +986,16 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
         Encodes videos into continuous embeddings that can be forwarded to the language model.
 
         Args:
-            pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, temporal, height, width)`):
-                The tensors corresponding to the input videos.
+            pixel_values_videos: Pre-processed patches from Qwen2VL processor.
+                `torch.FloatTensor` of shape `(total_patches, num_channels, patch_size, patch_size)`
             video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
                 The temporal, height and width of feature shape of each video in LLM.
         """
         # Convert to correct dtype
-        pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+        pixel_values_videos = pixel_values_videos.type(self.visual.embeddings.patch_embedding.weight.dtype)
 
-        # Forward through vision model (batch mode)
-        vision_output = self.visual(pixel_values_videos, visible_indices=None)
+        # Forward through vision model with grid_thw
+        vision_output = self.visual(pixel_values_videos, grid_thw=video_grid_thw, visible_indices=None)
 
         # Extract the actual tensor from BaseModelOutputWithPooling
         if hasattr(vision_output, "last_hidden_state"):
@@ -1236,43 +1024,18 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
         Encodes images into continuous embeddings that can be forwarded to the language model.
 
         Args:
-            pixel_values: Can be one of:
-                - `torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`
-                - `List[torch.FloatTensor]` of variable-size images
+            pixel_values: Pre-processed patches from Qwen2VL processor.
+                - `torch.FloatTensor` of shape `(total_patches, num_channels, patch_size, patch_size)`
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
                 The temporal, height and width of feature shape of each image in LLM.
         """
-        # Handle list of images (variable sizes) - need to process one by one
-        if isinstance(pixel_values, (list, tuple)):
-            all_image_embeds = []
-            for img in pixel_values:
-                if img.dim() == 3:
-                    # [C, H, W] -> [1, C, H, W]
-                    img = img.unsqueeze(0)
-
-                # Convert to correct dtype
-                img = img.type(self.visual.dtype)
-
-                # Forward through vision model (batch mode)
-                vision_output = self.visual(img, visible_indices=None)
-
-                # Extract the actual tensor from BaseModelOutputWithPooling
-                if hasattr(vision_output, "last_hidden_state"):
-                    img_embeds = vision_output.last_hidden_state
-                else:
-                    img_embeds = vision_output[0]
-
-                all_image_embeds.append(img_embeds.view(-1, img_embeds.shape[-1]))
-
-            return all_image_embeds
-
-        # Standard [B, C, H, W] format
-        if pixel_values.dim() == 4:
+        # Standard format from Qwen2VL processor
+        if pixel_values.dim() == 2:
             # Convert to correct dtype
-            pixel_values = pixel_values.type(self.visual.dtype)
+            pixel_values = pixel_values.type(self.visual.embeddings.patch_embedding.weight.dtype)
 
-            # Forward through vision model (batch mode)
-            vision_output = self.visual(pixel_values, visible_indices=None)
+            # Forward through vision model with grid_thw
+            vision_output = self.visual(pixel_values, grid_thw=image_grid_thw, visible_indices=None)
 
             # Extract the actual tensor from BaseModelOutputWithPooling
             if hasattr(vision_output, "last_hidden_state"):
@@ -1280,23 +1043,25 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
             else:
                 image_embeds = vision_output[0]
 
-            # Compute split sizes
-            batch_size = pixel_values.shape[0]
+            # Compute split sizes from grid_thw
             if image_grid_thw is not None:
                 split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
             else:
-                split_sizes = [image_embeds.shape[1]] * batch_size
+                # Fallback: assume single image
+                split_sizes = [image_embeds.shape[0] if image_embeds.dim() == 2 else image_embeds.shape[1]]
 
             # Split embeddings per image
+            image_embeds_flat = image_embeds.view(-1, image_embeds.shape[-1])
             if len(split_sizes) > 1:
-                image_embeds = torch.split(image_embeds.view(-1, image_embeds.shape[-1]), split_sizes)
+                image_embeds = list(torch.split(image_embeds_flat, split_sizes))
             else:
-                image_embeds = [image_embeds.view(-1, image_embeds.shape[-1])]
+                image_embeds = [image_embeds_flat]
 
             return image_embeds
         else:
             raise ValueError(
-                f"Unsupported pixel_values type/shape: {type(pixel_values)}, {pixel_values.shape if hasattr(pixel_values, 'shape') else 'N/A'}"
+                f"Unsupported pixel_values shape: expected 4D tensor [total_patches, C, H, W], "
+                f"got {pixel_values.shape if hasattr(pixel_values, 'shape') else type(pixel_values)}"
             )
 
     def get_placeholder_mask(
