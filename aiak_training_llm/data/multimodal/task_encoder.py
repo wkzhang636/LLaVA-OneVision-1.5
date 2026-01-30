@@ -48,6 +48,7 @@ class ImageTaskSample(Sample):
     # (c, h, w)
     imgs: List[torch.Tensor] = None
     pixel_values_videos: List[torch.Tensor] = None
+    patch_positions: Optional[List[torch.Tensor]] = None
 
 @dataclass
 class ImageTaskSamplePacked(Sample):
@@ -70,6 +71,7 @@ class ImageTaskSamplePacked(Sample):
     attn_mask: torch.Tensor = None
     imgs: List[torch.Tensor] = None   # Input images
     pixel_values_videos: List[torch.Tensor] = None
+    patch_positions: Optional[List[torch.Tensor]] = None
 
 # Typing for the resulting batch data after encode_batch()
 @dataclass
@@ -94,6 +96,7 @@ class ImageTaskBatchPacked(Batch):
     attn_mask: torch.Tensor = None
     imgs: torch.Tensor = None # All image tiles stacked into a single tensor (num_tiles, C, H, W)
     pixel_values_videos: torch.Tensor = None
+    patch_positions: Optional[torch.Tensor] = None
 
 # Based on https://github.com/hiyouga/LLaMA-Factory/
 #          blob/641d0dab08d96a93c34657742213d8994d9ed476/src/llamafactory/data/processors/processor_utils.py#L19
@@ -162,32 +165,70 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
     @stateless(restore_seeds=True)
     def encode_sample(self, sample: Union[CaptioningSample, OCRSample, VQASample, SimilarityInterleavedSample]):
         """ Generates an encoded sample from a raw sample. """
-        if isinstance(sample, CaptioningSample):
-            yield self.encode_captioning(sample)
-        elif isinstance(sample, VQASample):
-            yield self.encode_vaq(sample)
-        elif isinstance(sample, MultiVidQASample):
+        # if isinstance(sample, CaptioningSample):
+        #     yield self.encode_captioning(sample)
+        # elif isinstance(sample, VQASample):
+        #     yield self.encode_vaq(sample)
+        if isinstance(sample, MultiVidQASample):
             yield self.encode_multi_vid_qa(sample)
         elif isinstance(sample, MultiMixQASample):
             yield self.encode_multi_mix_qa(sample)
         elif isinstance(sample, PackedCaptioningSample):
+            # assert 4==5, f'Packedcaptioningsample\n{sample}'
             # print(f"-------------PackedCaptioningSample---------------")
             # print(sample)
             # print(f"-------------PackedCaptioningSample---------------")
             n_orig_sample = len(sample.images)
             l_Qwen2VLImageTaskSample = []
             for idx in range(n_orig_sample):
-                if int(os.environ.get("OFFLINE_PACKING_VQA",0))==1:
-                    cur_capsample = VQASample(
+                if int(os.environ.get("OFFLINE_PACKING_BMR",0))==1:
+                    def convert_to_messages(cur_prompt, cur_caption):
+                        """
+                        {cur_prompt, cur_caption}---> messages
+                        """
+
+                        if len(cur_prompt) != len(cur_caption):
+                            raise ValueError(f"cur_prompt & cur_caption have different lengths\ncur_prompt:{cur_prompt}\ncur_caption:{cur_caption}")
+
+                        messages = []
+                        for prompt, caption in zip(cur_prompt, cur_caption):
+                            messages.append({
+                                "content": prompt,
+                                "role": "user"
+                            })
+
+                            messages.append({
+                                "content": caption,
+                                "role": "assistant"
+                            })
+
+                        return messages
+                    sample_images = sample.images[idx] if isinstance(sample.images[idx], list) else [sample.images[idx]] if sample.images[idx] else None
+
+                    sample_patch_positions = None
+                    if hasattr(sample, 'patch_positions') and sample.patch_positions is not None and idx < len(sample.patch_positions):
+                        pp = sample.patch_positions[idx]
+                        sample_patch_positions = pp if isinstance(pp, list) else [pp] if pp is not None else None
+
+                    cur_prompt = sample.prompts[idx]
+                    cur_caption = sample.captions[idx]
+                    if isinstance(cur_prompt, str):
+                        cur_prompt = [cur_prompt]
+                    if isinstance(cur_caption, str):
+                        cur_caption = [cur_caption]
+
+                    cur_capsample = MultiMixQASample(
                         __key__=f"{sample.__key__}.img{idx:03d}_jpg",
                         __restore_key__=sample.__restore_key__,
-                        __subflavor__=None,
+                        __subflavor__='BMR',
                         __subflavors__=sample.__subflavors__,
-                        image=sample.images[idx],
-                        answers=sample.captions[idx],
-                        context=sample.prompts[idx]
-                    )                    
-                    l_Qwen2VLImageTaskSample.append(self.encode_vqa4packing(cur_capsample))
+                        messages=convert_to_messages(cur_prompt, cur_caption),
+                        video=None,
+                        system=None,
+                        image=sample_images,
+                        patch_positions=sample_patch_positions
+                    )
+                    l_Qwen2VLImageTaskSample.append(self.encode_multi_mix_qa(cur_capsample))
                 else:
                     cur_capsample = CaptioningSample(
                         __key__=f"{sample.__key__}.img{idx:03d}_jpg",
@@ -204,15 +245,15 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         else:
             raise NotImplementedError("Sample format not supported", sample)
 
-    @abstractmethod
-    def encode_captioning(self, sample: CaptioningSample) -> ImageTaskSample:
-        """ Generates an encoded captioning sample from a raw sample. """
-        pass
+    # @abstractmethod
+    # def encode_captioning(self, sample: CaptioningSample) -> ImageTaskSample:
+    #     """ Generates an encoded captioning sample from a raw sample. """
+    #     pass
 
-    @abstractmethod
-    def encode_vaq(self, sample: VQASample) -> ImageTaskSample:
-        """ Generates an encoded vqa sample from a raw sample. """
-        pass
+    # @abstractmethod
+    # def encode_vaq(self, sample: VQASample) -> ImageTaskSample:
+    #     """ Generates an encoded vqa sample from a raw sample. """
+    #     pass
 
     @abstractmethod
     def encode_multi_vid_qa(self, sample: MultiVidQASample) -> ImageTaskSample:
@@ -232,6 +273,14 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         else:
             return torch.tensor([[0]], dtype=torch.float32)
 
+    def process_patch_positions(self, samples: List[Union[ImageTaskSample, ImageTaskSamplePacked]]) -> torch.Tensor:
+        """ Stack patch positions to [num_tiles, 3]. If there are no patch positions, then use a dummy tensor. """
+        patch_positions = [pp for s in samples if s.patch_positions is not None for pp in s.patch_positions]
+        if len(patch_positions) > 0:
+            return torch.cat(patch_positions, dim=0)  # 合并成一个 tensor [total_patches, 3]
+        else:
+            return None
+
     def process_videos(self, samples: List[Union[ImageTaskSample, ImageTaskSamplePacked]]) \
                                                                                     -> torch.Tensor:
         """" Process the data to get the model's input """
@@ -248,6 +297,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         pixel_values_videos = self.process_videos(samples)
         max_seq_len = max(len(s.tokens) for s in samples)
         max_seq_len = min(max_seq_len, self.args.seq_length)
+        patch_positions = self.process_patch_positions(samples)
 
         tokens = np.full((len(samples), max_seq_len), self.tokenizer.pad, dtype=np.int64)
         labels = np.full((len(samples), max_seq_len), IGNORE_INDEX, dtype=np.int64)
@@ -289,6 +339,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             num_tiles=num_tiles,
             cu_lengths=cu_lengths,
             max_lengths=max_lengths,
+            patch_positions=patch_positions,
         )
 
     def encode_batch(self, batch: ImageTaskBatchPacked) -> dict:
@@ -331,6 +382,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         packed_masks = []
         packed_imgs = []
         packed_videos = []
+        packed_patch_positions = []
 
         current_length = 0
         max_length = 0
@@ -344,7 +396,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 max_length = sample_len
 
             # If adding this sample exceeds the max length, stop.
-            # This should not happen. 
+            # This should not happen.
             # The select_samples_to_pack method should have already ensured that the samples fit.
             if current_length + sample_len > packing_seq_len:
                 print(f"packing_seq_len:{packing_seq_len}----<<<<<----{current_length + sample_len}")
@@ -360,6 +412,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 packed_imgs += sample.imgs
             if sample.pixel_values_videos is not None:
                 packed_videos += sample.pixel_values_videos
+            if sample.patch_positions is not None:
+                packed_patch_positions += sample.patch_positions
             current_length += sample_len
             cu_lengths.append(current_length)
 
@@ -381,6 +435,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             cu_lengths=torch.tensor(cu_lengths, dtype=torch.int32),
             max_length=max_length,
             num_tiles=[n for s in samples for n in s.num_tiles],
+            patch_positions=packed_patch_positions if packed_patch_positions else None,
         )
 
 

@@ -19,8 +19,8 @@ def build_sft_dataset(args):
     """build sft dataset"""
     tokenizer = build_tokenizer(args, chat_template=args.template)
     processor = AutoProcessor.from_pretrained(args.hf_tokenizer_path, trust_remote_code=True)
-    if args.image_resolution:
-        setattr(processor, "image_resolution", args.image_resolution)
+    # if args.image_resolution:
+    #     setattr(processor, "image_resolution", args.image_resolution)
 
     config = SFTDatasetConfig(
         random_seed=args.seed,

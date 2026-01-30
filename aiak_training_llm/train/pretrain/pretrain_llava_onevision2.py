@@ -118,9 +118,12 @@ def get_batch(data_iterator):
     video_grid_thw = None
     imgs = None
     pixel_values_videos = None
+    patch_positions = None
     if has_image:
         imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
         thw = tensor_parallel.broadcast_data(["image_grid_thw"], data, torch.int32)["image_grid_thw"]
+        if data is not None and "patch_positions" in data and data["patch_positions"] is not None:
+            patch_positions = tensor_parallel.broadcast_data(["patch_positions"], data, torch.int64)["patch_positions"]
     if has_video:
         pixel_values_videos = tensor_parallel.broadcast_data(["pixel_values_videos"], data, torch.float32)[
             "pixel_values_videos"
@@ -173,6 +176,7 @@ def get_batch(data_iterator):
         loss_mask,
         attn_mask_type,
         packed_seq_params,
+        patch_positions,
     )
 
 
@@ -253,6 +257,7 @@ def forward_step(data_iterator, model):
             loss_mask,
             attn_mask_type,
             packed_seq_params,
+            patch_positions,
         ) = get_batch(data_iterator)
 
     timers("batch-generator").stop()
@@ -269,6 +274,7 @@ def forward_step(data_iterator, model):
             packed_seq_params,
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
+            patch_positions=patch_positions,
         )
 
     return output_tensor, partial(loss_func, loss_mask)

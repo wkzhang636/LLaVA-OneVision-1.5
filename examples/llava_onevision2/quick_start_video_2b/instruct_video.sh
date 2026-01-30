@@ -1,6 +1,6 @@
 TP="${1:-1}"
 PP="${2:-1}"
-SEQ_LEN="${3:-32768}"
+SEQ_LEN="${3:-40000}"
 MBS="${4:-1}"
 GBS="${5:-224}"
 NSTEP="${6:-3500}"
@@ -10,7 +10,7 @@ AIAK_MAGATRON_PATH="${AIAK_MAGATRON_PATH:-${AIAK_TRAINING_PATH%/}/aiak_megatron}
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
 DATA_PATH=${DATA_PATH:-"/workspace/dataset/LLaVA-NeXT-780k-webdataset"}
 TOKENIZER_PATH=${TOKENIZER_PATH:-"/ov2/pretrain_models/preprocessor/preprocessor_llava_onevision1_5"}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/workspace/LLaVA-OneVision-2/stage_1.5_mid_training_llava_ov_2B_release"}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-""}
 
 #! /bin/bash
 # The script needs to be run on at least 1 nodes.
@@ -72,7 +72,7 @@ fi
 # --- End of Multi-node configuration ---
 
 
-SAVE_CKPT_PATH=ckpts/$(basename "$0" .sh)
+SAVE_CKPT_PATH=$OUTPUT_DIR/$(basename "$0" .sh)
 TENSORBOARD_PATH="${SAVE_CKPT_PATH}/tensorboard"
 
 mkdir -p "$SAVE_CKPT_PATH"
@@ -113,11 +113,10 @@ DATA_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --image-resolution 1000
     --training-phase sft
     --trainable-modules language_model adapter vision_model
     --seq-length "${SEQ_LEN}"
-    --max-position-embeddings 32768
+    --max-position-embeddings "${SEQ_LEN}"
     --init-method-std 0.02
     --micro-batch-size "${MBS}"
     --global-batch-size "${GBS}"
@@ -136,7 +135,6 @@ TRAINING_ARGS=(
     --lr-warmup-fraction 0.002
     --initial-loss-scale 65536
     --bf16
-    --load "$CHECKPOINT_PATH"
     --save "$SAVE_CKPT_PATH"
     --save-interval 2000
     --ckpt-format torch
@@ -147,6 +145,12 @@ TRAINING_ARGS=(
     --recompute-method uniform
     --recompute-num-layers 1
 )
+
+if [ -d "$CHECKPOINT_PATH" ]; then
+    TRAINING_ARGS+=(
+        --load "$CHECKPOINT_PATH"
+    )
+fi
 
 MODEL_PARALLEL_ARGS=(
     --attention-backend flash

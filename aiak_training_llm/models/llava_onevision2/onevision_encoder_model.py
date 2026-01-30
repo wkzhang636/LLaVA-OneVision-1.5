@@ -9,6 +9,7 @@ from aiak_training_llm.models.llava_onevision2.llava_onevision2_config import (
 )
 from aiak_training_llm.models.llava_onevision2.vision_transformer_block import TransformerBlock
 
+from typing import List, Optional
 
 class PatchEmbed(torch.nn.Module):
     """
@@ -131,6 +132,31 @@ class VideoRotaryEmbeddingSplit466(torch.nn.Module):
         # Concatenate frequencies: [seq_len, half]
         sample_freqs = torch.cat([ft[t_ids], fh[h_ids], fw[w_ids]], dim=-1)
         return sample_freqs
+    
+    def forward_from_positions(self, patch_positions: torch.Tensor) -> torch.Tensor:
+        """
+        Compute rotary position embeddings from explicit patch positions.
+
+        Args:
+            patch_positions: [seq_len, 3] tensor with [t, h, w] positions for each patch
+
+        Returns:
+            freqs: [seq_len, half] tensor of position frequencies
+        """
+        device = patch_positions.device
+        inv_t = self.inv_freq_t.to(device=device)
+        inv_h = self.inv_freq_h.to(device=device)
+        inv_w = self.inv_freq_w.to(device=device)
+
+        t_pos = patch_positions[:, 0].float()
+        h_pos = patch_positions[:, 1].float()
+        w_pos = patch_positions[:, 2].float()
+
+        ft = torch.outer(t_pos, inv_t)
+        fh = torch.outer(h_pos, inv_h)
+        fw = torch.outer(w_pos, inv_w)
+
+        return torch.cat([ft, fh, fw], dim=-1)
 
 
 def convert_rope_to_block_layout(
@@ -177,6 +203,53 @@ def convert_rope_to_block_layout(
     freqs = freqs.view(t * h * w, half)
 
     return freqs
+
+
+def convert_positions_to_block_layout(
+    positions: torch.Tensor, t: int, h: int, w: int, spatial_merge_size: int = 2
+) -> torch.Tensor:
+    """
+    Convert patch positions from row-major order to 2x2 block layout.
+
+    This function reorders patch positions to match the 2x2 block arrangement
+    used by the image processor. Uses index-based reordering instead of reshape.
+
+    Args:
+        positions: Patch positions in row-major order, shape [t*h*w, 3]
+        t: temporal dimension
+        h: height (unmerged patch count)
+        w: width (unmerged patch count)
+        spatial_merge_size: size of spatial merge blocks (default: 2)
+
+    Returns:
+        torch.Tensor: Patch positions in 2x2 block order, same shape [t*h*w, 3]
+    """
+    sms = spatial_merge_size
+    if sms == 1:
+        return positions
+
+    device = positions.device
+    total_patches = t * h * w
+
+    # Generate row-major indices: [0, 1, 2, ..., t*h*w-1]
+    # Reshape to [t, h, w]
+    indices = torch.arange(total_patches, device=device).view(t, h, w)
+
+    # Calculate merged dimensions
+    h_merged = h // sms
+    w_merged = w // sms
+
+    # Reshape to [t, h_merged, sms, w_merged, sms]
+    indices = indices.view(t, h_merged, sms, w_merged, sms)
+
+    # Permute to [t, h_merged, w_merged, sms_h, sms_w] - 2x2 block order
+    indices = indices.permute(0, 1, 3, 2, 4).contiguous()
+
+    # Flatten to get the reordering indices
+    indices = indices.view(total_patches)
+
+    # Apply the reordering to positions
+    return positions[indices]
 
 
 class OneVisionEncoderModel(VisionModule):
@@ -242,7 +315,7 @@ class OneVisionEncoderModel(VisionModule):
         """
         self.decoder.set_input_tensor(input_tensor)
 
-    def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, grid_thw: torch.Tensor, patch_positions: List[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass with packed sequence support and 3D RoPE.
 
@@ -271,19 +344,45 @@ class OneVisionEncoderModel(VisionModule):
         # We first generate RoPE in row-major order, then convert to block order.
         all_rotary_pos_emb = []
         tokens_per_sample = []
-        for i in range(batch_size):
-            t, h, w = grid_thw[i]
-            t, h, w = t.item(), h.item(), w.item()
-            tokens_per_sample.append(t * h * w)
 
-            # Generate RoPE in row-major order (original 1x1 layout)
-            sample_freqs = self.video_rope(t=t, h=h, w=w, device=x.device)
-            # sample_freqs shape: [t * h * w, half]
+        if patch_positions is not None:
+            # Use provided patch positions (from pre-computed data)
+            # patch_positions is [total_patches, 3] with (t, h, w) per patch
+            # Need to reorder from row-major to 2x2 block layout for each sample
+            
+            offset = 0
+            for i in range(batch_size):
+                t, h, w = grid_thw[i]
+                t, h, w = t.item(), h.item(), w.item()
+                num_patches = t * h * w
+                tokens_per_sample.append(num_patches)
+                
+                # Extract this sample's positions
+                sample_positions = patch_positions[offset:offset + num_patches]
+                
+                # Convert positions from row-major to 2x2 block layout
+                sample_positions = convert_positions_to_block_layout(sample_positions, t, h, w, sms)
+                
+                # Compute RoPE from reordered positions
+                sample_freqs = self.video_rope.forward_from_positions(sample_positions)
+                all_rotary_pos_emb.append(sample_freqs)
+                
+                offset += num_patches
+        else:
+            # Generate positions from grid_thw (original behavior)
+            for i in range(batch_size):
+                t, h, w = grid_thw[i]
+                t, h, w = t.item(), h.item(), w.item()
+                tokens_per_sample.append(t * h * w)
 
-            # Convert from row-major (1x1) to 2x2 block layout
-            sample_freqs = convert_rope_to_block_layout(sample_freqs, t, h, w, sms)
+                # Generate RoPE in row-major order (original 1x1 layout)
+                sample_freqs = self.video_rope(t=t, h=h, w=w, device=x.device)
+                # sample_freqs shape: [t * h * w, half]
 
-            all_rotary_pos_emb.append(sample_freqs)
+                # Convert from row-major (1x1) to 2x2 block layout
+                sample_freqs = convert_rope_to_block_layout(sample_freqs, t, h, w, sms)
+
+                all_rotary_pos_emb.append(sample_freqs)
 
         rotary_pos_emb = torch.cat(all_rotary_pos_emb, dim=0)
 

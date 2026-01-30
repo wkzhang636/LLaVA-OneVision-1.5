@@ -1,31 +1,25 @@
-"""
-Copyright 2024 the LlamaFactory team.
-Copyright (c) 2024, AIAK team. All rights reserved.
-This code was adopted from https://github.com/hiyouga/LLaMA-Factory
-and the source code is licensed under the Apache license found in the
-LICENSE file in the root directory of this source tree.
-"""
-
 import math
 from copy import deepcopy
 from io import BytesIO
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, TypedDict, Union, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Type, TypedDict, Union
 
 import numpy as np
-from transformers.image_utils import get_image_size, to_numpy_array
+from PIL import Image
+from PIL.Image import Image as ImageObject
 from typing_extensions import override
 
 from aiak_training_llm.utils.constants import Placeholder
-
-from PIL import Image
-from PIL.Image import Image as ImageObject
+from transformers.image_utils import get_image_size, to_numpy_array
 
 
 if TYPE_CHECKING:
     import torch
+
     from transformers.image_processing_utils import BaseImageProcessor
+
     class EncodedImage(TypedDict):
-        """ Encoded image type. """
+        """Encoded image type."""
+
         path: Optional[str]
         bytes: Optional[bytes]
 
@@ -34,7 +28,8 @@ if TYPE_CHECKING:
 
 
 class MMPlugin:
-    """ MM Plugin """
+    """MM Plugin"""
+
     def __init__(self, image_token: Optional[str], video_token: Optional[str]) -> None:
         self.image_token = image_token
         self.video_token = video_token
@@ -57,11 +52,11 @@ class MMPlugin:
         r"""
         Pre-processes a single image.
         """
-        image_resolution: int = kwargs.get("image_resolution")
-        if max(image.width, image.height) > image_resolution:
-            resize_factor = image_resolution / max(image.width, image.height)
-            width, height = int(image.width * resize_factor), int(image.height * resize_factor)
-            image = image.resize((width, height), resample=Image.NEAREST)
+        # image_resolution: int = kwargs.get("image_resolution")
+        # if max(image.width, image.height) > image_resolution:
+        #     resize_factor = image_resolution / max(image.width, image.height)
+        #     width, height = int(image.width * resize_factor), int(image.height * resize_factor)
+        #     image = image.resize((width, height), resample=Image.NEAREST)
 
         if image.mode != "RGB":
             image = image.convert("RGB")
@@ -100,7 +95,6 @@ class MMPlugin:
 
         return results
 
-
     def _get_mm_inputs(
         self,
         images: Sequence["ImageInput"],
@@ -125,7 +119,7 @@ class MMPlugin:
         if len(images) != 0:
             images = self._regularize_images(
                 images,
-                image_resolution=getattr(processor, "image_resolution", 512),
+                # image_resolution=getattr(processor, "image_resolution", 512),
             )
             input_dict["images"] = images
 
@@ -173,7 +167,8 @@ class MMPlugin:
 
 
 class Qwen2VLPlugin(MMPlugin):
-    """ Qwen2VL plugin """
+    """Qwen2VL plugin"""
+
     @override
     def _preprocess_image(self, image: "ImageObject", **kwargs) -> "ImageObject":
         image = super()._preprocess_image(image, **kwargs)

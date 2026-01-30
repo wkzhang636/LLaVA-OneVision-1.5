@@ -1,10 +1,11 @@
 """ MultiMixQASample """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 from megatron.energon.flavors.base_dataset import Sample
 from megatron.energon.flavors.webdataset import VideoData
 import torch
+import numpy as np
 
 
 @dataclass
@@ -22,3 +23,6 @@ class MultiMixQASample(Sample):
 
     # system
     system: Optional[str] = None
+
+    # patch positions for each image: List of np.ndarray with shape (num_patches, 3) containing [T, H, W]
+    patch_positions: Optional[List[np.ndarray]] = None

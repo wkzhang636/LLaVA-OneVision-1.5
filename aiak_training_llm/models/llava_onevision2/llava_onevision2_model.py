@@ -203,6 +203,7 @@ class LlavaOnevision2(MegatronModule):
         inference_params: InferenceParams = None,
         pixel_values_videos: torch.Tensor = None,
         video_grid_thw: torch.Tensor = None,
+        patch_positions: Optional[List[torch.tensor]] = None,
     ) -> torch.Tensor:
         """Forward function of the Qwen-VL model.
 
@@ -242,7 +243,7 @@ class LlavaOnevision2(MegatronModule):
             image_embeddings = None
         elif self.add_encoder:
             if images is not None:
-                image_embeddings = self.vision_model(images, grid_thw=image_grid_thw)  # [img_len, h_vision]
+                image_embeddings = self.vision_model(images, grid_thw=image_grid_thw, patch_positions=patch_positions)  # [img_len, h_vision]
                 image_embeddings = self.adapter(image_embeddings)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeddings.shape[0]

@@ -389,9 +389,6 @@ def _add_extra_multimodal_args(parser):
     group.add_argument("--add-question-in-pretrain", action="store_true",
                        help="Whether add question in pretrain VQASample")
 
-    # use for qwen2vl now
-    group.add_argument('--image-resolution', type=int,
-                       help='Resolution of image inputs')
     group.add_argument('--min-pixels', type=int, default=4 * 28 * 28,
                        help='Minimum image pixels')
 
