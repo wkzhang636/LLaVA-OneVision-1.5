@@ -1,22 +1,87 @@
 import logging
 from collections import namedtuple
 from functools import partial
+from typing import List, Optional
 
 import torch
-from megatron.core import InferenceParams
+from megatron.core import InferenceParams, parallel_state
+from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import make_viewless_tensor
+from torch import Tensor
 
-from aiak_training_llm.models.llava_onevision2.onevision_encoder_model import OneVisionEncoderModel
+from aiak_training_llm.models.llava_onevision1_5.rice_vision_model import RiceViTModel, VisionModel
 from aiak_training_llm.models.qwen import QwenModel
 from aiak_training_llm.models.qwen_vl.adapter import Adapter
 from aiak_training_llm.models.qwen_vl.utils import get_inputs_on_this_cp_rank
 
 
-class LlavaOnevision2(MegatronModule):
+def _rotate_half(x):
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _get_thd_freqs_on_this_cp_rank(cp_rank: int, cp_size: int, x: Tensor, freqs: Tensor) -> Tensor:
+    if cp_size > 1:
+        cp_seg = x.size(0) // 2
+        full_seqlen = cp_size * x.size(0)
+        return torch.cat(
+            [
+                freqs[cp_rank * cp_seg : (cp_rank + 1) * cp_seg],
+                freqs[full_seqlen - (cp_rank + 1) * cp_seg : full_seqlen - cp_rank * cp_seg],
+            ]
+        )
+    else:
+        return freqs[: x.size(0)]
+
+
+def _apply_mrope_bshd(t, freq, config, cu_seqlens=None, mrope_section=[16, 24, 24]):
+    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors
+    (https://qwenlm.github.io/blog/qwen2-vl/).
+    Args:
+        t (torch.Tensor): Input tensor of shape [S, B, heads, dim]
+        freq (torch.Tensor): Frequency tensor of shape [S, B, 3, dim]
+    """
+    cos = freq.cos().to(dtype=t.dtype)
+    sin = freq.sin().to(dtype=t.dtype)
+    mrope_section = mrope_section * 2
+
+    cos = torch.cat([m[..., i % 3, :] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(2)
+    sin = torch.cat([m[..., i % 3, :] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(2)
+
+    t = (t * cos) + (_rotate_half(t) * sin)
+    return t
+
+
+def apply_mrope(t, freq, config, cu_seqlens=None, mrope_section=[16, 24, 24]):
+    """mrope"""
+    if cu_seqlens is not None:
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cu_seqlens = cu_seqlens // cp_size
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
+        return torch.cat(
+            [
+                _apply_mrope_bshd(
+                    x.unsqueeze(1),
+                    _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freq),
+                    config,
+                    cu_seqlens,
+                    mrope_section,
+                )
+                for x in torch.split(t, seqlens)
+            ]
+        ).squeeze(1)
+    else:
+        return _apply_mrope_bshd(t, freq, config, cu_seqlens, mrope_section)
+
+
+class LlavaOnevision1_5(MegatronModule):
     """
     Args:
         language_transformer_config (TransformerConfig): Transformer config for the language model.
@@ -92,11 +157,20 @@ class LlavaOnevision2(MegatronModule):
 
         #  define the vision model and the projection from vision model outputs to language model inputs.
         if self.add_encoder:
-            self.vision_model = OneVisionEncoderModel(
+            # if vision_config.normalization == "RMSNorm":
+            self.vision_model = RiceViTModel(
                 vision_config,
                 vision_layer_spec,
             )
-
+            # else:
+            #     self.vision_model = VisionModel(
+            #         vision_config,
+            #         vision_layer_spec,
+            #     )
+            # Map (intermediate) vision model outputs to the language model input dimension.
+            # from megatron.training import print_rank_0
+            # print_rank_0(f"vision_config.hidden_size: {vision_config.hidden_size}")
+            # print_rank_0(f"language_config.hidden_size: {language_config.hidden_size}")
             self.adapter = Adapter(
                 adapter_config,
                 adapter_layer_spec,
@@ -115,6 +189,10 @@ class LlavaOnevision2(MegatronModule):
         # # This attribute is needed to check if an all-reduce is required
         # # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
         if self.add_decoder:
+            # self.rotary_emb = Qwen2VLRotaryEmbedding(
+            #     dim=language_config.hidden_size // language_config.num_attention_heads,
+            #     theta=language_rotary_base
+            # )
             self.language_model = QwenModel(
                 config=language_config,
                 transformer_layer_spec=language_layer_spec,
@@ -183,13 +261,12 @@ class LlavaOnevision2(MegatronModule):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        attn_mask_type: AttnMaskType | None = None,
+        attn_mask_type: Optional[AttnMaskType] = None,
         labels: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         inference_params: InferenceParams = None,
         pixel_values_videos: torch.Tensor = None,
         video_grid_thw: torch.Tensor = None,
-        patch_positions: list[torch.tensor] | None = None,
     ) -> torch.Tensor:
         """Forward function of the Qwen-VL model.
 
@@ -209,7 +286,17 @@ class LlavaOnevision2(MegatronModule):
             output (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape
                 [b, s, vocab_size].
         """
-
+        # from megatron.training import print_rank_0
+        # print_rank_0(
+        #     f"> forward step: input_ids shape {input_ids.shape}, "
+        #     f"images shape {images.shape}, "
+        #     f"image_grid_thw shape {image_grid_thw.shape}, "
+        #     # f"labels shape {labels.shape}, "
+        #     f"attn_mask_type {attn_mask_type}, "
+        #     f"position_ids shape {position_ids.shape if position_ids is not None else None}"
+        # )
+        # print_rank_0(input_ids)
+        # print_rank_0(position_ids)
         use_inference_kv_cache = (
             inference_params is not None and "image_tokens_count" in inference_params.key_value_memory_dict
         )
@@ -219,10 +306,10 @@ class LlavaOnevision2(MegatronModule):
             image_embeddings = None
         elif self.add_encoder:
             if images is not None:
-                image_embeddings = self.vision_model(
-                    images, grid_thw=image_grid_thw, patch_positions=patch_positions
+                image_embeddings, window_index = self.vision_model(
+                    images, grid_thw=image_grid_thw
                 )  # [img_len, h_vision]
-                image_embeddings = self.adapter(image_embeddings)
+                image_embeddings = self.adapter(image_embeddings, window_index)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeddings.shape[0]
                 if n_image_tokens != n_image_features:
@@ -234,10 +321,27 @@ class LlavaOnevision2(MegatronModule):
                     inference_params.key_value_memory_dict["image_tokens_count"] = image_embeddings.shape[0]
             if pixel_values_videos is not None:
                 raise NotImplementedError(
-                    "In LLaVA-OneVision2, video and images are treated as the same input type. "
-                    "Please use the 'images' argument for both."
+                    "Video input is not supported in RiceVLModel. "
+                    "Please use a different model that supports video input."
                 )
+                # pixel_values_videos: [video_seq_len, num_channels * temporal_size * patch_size * patch_size]
+                # video_grid_thw: [num_videos, 3]
+                # # Get the video embeddings from the vision model.
+                # video_embeddings, window_index = self.vision_model(pixel_values_videos, grid_thw=video_grid_thw)
+                # video_embeddings = self.adapter(video_embeddings, window_index)
+                # n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+                # n_video_features = video_embeddings.shape[0]
+                # if n_video_tokens != n_video_features:
+                #     raise ValueError(
+                #         f"video features {n_video_features} != video tokens {n_video_tokens}"
+                #     )
 
+                # # If running inference, the language model KV cache will be updated for image token positions.
+                # # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.
+                # if inference_params is not None:
+                #     inference_params.key_value_memory_dict["video_tokens_count"] = (
+                #         video_embeddings.shape[0]
+                #     )
         else:
             vision_embeddings = self.encoder_hidden_state.squeeze(0) if self.encoder_hidden_state is not None else None
 
@@ -270,12 +374,26 @@ class LlavaOnevision2(MegatronModule):
                     image_embeddings = image_embeddings.to(language_embeddings.device, language_embeddings.dtype)
                     combined_embeddings = language_embeddings.masked_scatter(images_mask, image_embeddings)
 
+                if pixel_values_videos is not None and self.config.video_token_id in input_ids:
+                    video_token_id = self.config.video_token_id
+                    videos_mask = (
+                        (input_ids == video_token_id)
+                        .transpose(0, 1)
+                        .unsqueeze(-1)
+                        .expand_as(language_embeddings)
+                        .to(language_embeddings.device)
+                    )
+                    video_embeddings = video_embeddings.to(language_embeddings.device, language_embeddings.dtype)
+                    combined_embeddings = language_embeddings.masked_scatter(videos_mask, video_embeddings)
+
             if self.config.context_parallel_size > 1:
                 combined_embeddings = get_inputs_on_this_cp_rank(combined_embeddings)
 
         else:
             combined_embeddings = None
             input_tensor = self.language_model.decoder.input_tensor
+
+        # rotary_pos_emb = self.rotary_emb(position_ids).transpose(0, 2).contiguous()
 
         output = self.language_model(
             input_ids=None,
@@ -293,110 +411,9 @@ class LlavaOnevision2(MegatronModule):
 
         return output
 
-    def forward_debug(
-        self,
-        images: torch.Tensor,
-        image_grid_thw: torch.Tensor,
-        input_ids: torch.Tensor = None,
-        position_ids: torch.Tensor = None,
-        attention_mask: torch.Tensor = None,
-        attn_mask_type: AttnMaskType | None = None,
-        labels: torch.Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
-        inference_params: InferenceParams = None,
-    ) -> dict:
-        """Forward pass with debug outputs for consistency checking.
-
-        This method captures intermediate outputs at each stage of the forward pass
-        to enable layer-by-layer comparison with HuggingFace implementation.
-
-        Args:
-            images (torch.Tensor): Input image patches of shape [total_patches, patch_dim].
-            image_grid_thw (torch.Tensor): Grid dimensions [batch_size, 3] with (T, H, W).
-            input_ids (torch.Tensor): Optional input text ids [batch, text_seq_len].
-            position_ids (torch.Tensor): Optional input text position ids.
-            attention_mask (torch.Tensor): Optional attention mask.
-            attn_mask_type: Optional attention mask type.
-            labels (torch.Tensor): Optional target text labels.
-            packed_seq_params: Optional packed sequence parameters.
-            inference_params: Optional inference parameters.
-
-        Returns:
-            dict: Dictionary containing intermediate outputs:
-                - "before_adapter": Vision encoder output before adapter/merger
-                - "after_adapter": Vision encoder output after adapter/merger
-                - "after_merger": Alias for "after_adapter"
-                - "vision_encoder_debug": Debug output from vision encoder
-                - "language_embeddings": Language model input embeddings (if input_ids provided)
-                - "combined_embeddings": Combined vision+language embeddings (if input_ids provided)
-                - "logits": Model output logits (if input_ids provided)
-        """
-        output = {}
-
-        # Store inputs for consistency checking
-        output["input_images"] = images.clone()
-        output["input_grid_thw"] = image_grid_thw.clone()
-
-        if self.add_encoder and images is not None:
-            # Get vision encoder debug output
-            vision_debug = self.vision_model.forward_debug(images, grid_thw=image_grid_thw)
-            output["vision_encoder_debug"] = vision_debug
-
-            # Vision encoder output (before adapter)
-            vision_output = vision_debug.get("before_adapter")
-            if vision_output is None:
-                # Fallback: run normal forward
-                vision_output = self.vision_model(images, grid_thw=image_grid_thw)
-            output["before_adapter"] = vision_output.clone()
-
-            # Apply adapter/merger
-            image_embeddings = self.adapter(vision_output)
-            output["after_adapter"] = image_embeddings.clone()
-            output["after_merger"] = image_embeddings.clone()  # Alias for compatibility
-
-        # If input_ids provided, continue with language model
-        if input_ids is not None and self.add_decoder and self.pre_process:
-            # Get language embeddings
-            language_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
-            output["language_embeddings"] = language_embeddings.clone()
-
-            # Combine vision and language embeddings
-            if images is not None and self.config.image_token_id in input_ids:
-                image_token_id = self.config.image_token_id
-                images_mask = (
-                    (input_ids == image_token_id)
-                    .transpose(0, 1)
-                    .unsqueeze(-1)
-                    .expand_as(language_embeddings)
-                    .to(language_embeddings.device)
-                )
-                image_embeddings = image_embeddings.to(language_embeddings.device, language_embeddings.dtype)
-                combined_embeddings = language_embeddings.masked_scatter(images_mask, image_embeddings)
-            else:
-                combined_embeddings = language_embeddings
-
-            output["combined_embeddings"] = combined_embeddings.clone()
-
-            # Run through language model
-            logits = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                attention_mask=attention_mask,
-                attn_mask_type=attn_mask_type,
-                decoder_input=combined_embeddings,
-                labels=labels,
-                rotary_pos_emb=None,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                extra_block_kwargs={},
-            )
-            output["logits"] = logits
-
-        return output
-
 
 def _load_state_dict_hook_ignore_param_names(
-    param_names: list[str], module: torch.nn.Module, incompatible_keys: namedtuple
+    param_names: List[str], module: torch.nn.Module, incompatible_keys: namedtuple
 ):
     """Hook to ignore missing keys during checkpoint loading.
 

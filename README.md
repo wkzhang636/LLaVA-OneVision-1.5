@@ -249,7 +249,7 @@ Note: When merging weights, the adapter component will be initialized with defau
 Convert the model from Hugging Face format to Megatron format:
 
 ```bash
-AIAK_TRAINING_PATH=/workspace/LLaVA-OneVision-2 bash examples/llava_ov_1_5/convert/convert_4b_hf_to_mcore.sh \
+AIAK_TRAINING_PATH=/workspace/LLaVA-OneVision-2 bash examples/llava_onevision1_5/convert/convert_4b_hf_to_mcore.sh \
 LLaVA-OneVision-1.5-4B-stage0 \
 LLaVA-OneVision-1.5-4B-stage0_mcore_tp1_pp1 \
 1 1
@@ -272,7 +272,7 @@ AIAK_TRAINING_PATH=/workspace/LLaVA-OneVision-2 \
 DATA_PATH=LLaVA-558K-Webdataset \
 TOKENIZER_PATH=LLaVA-OneVision-1.5-4B-stage0 \
 CHECKPOINT_PATH=LLaVA-OneVision-1.5-4B-stage0_mcore_tp1_pp1 \
-bash examples/llava_ov_1_5/quick_start/stage_1_alignment_llava_ov_4b.sh
+bash examples/llava_onevision1_5/quick_start/stage_1_alignment_llava_ov_4b.sh
 ```
 
 ### 4. Stage 1.5 Mid-Training 
@@ -282,7 +282,7 @@ Download our lightweight packed subset from [LLaVA-OneVision-1.5-Mid-Training-Qu
 ```bash
 # ============================================================
 # Convert model to release format
-bash examples/llava_ov_1_5/convert/convert_4b_mcore_to_release.sh \
+bash examples/llava_onevision1_5/convert/convert_4b_mcore_to_release.sh \
 stage_1_alignment_llava_ov_4b/iter_0002500/ \
 stage_1_alignment_llava_ov_4b_release 1 1
 # ============================================================
@@ -291,7 +291,7 @@ AIAK_TRAINING_PATH=/workspace/LLaVA-OneVision-2 \
 DATA_PATH=LLaVA-OneVision-1.5-Mid-Training-Webdataset-Quick-Start-3M \
 TOKENIZER_PATH=LLaVA-OneVision-1.5-4B-stage0 \
 CHECKPOINT_PATH=stage_1_alignment_llava_ov_4b_release \
-bash examples/llava_ov_1_5/quick_start/stage_1.5_mid_training_llava_ov_4b.sh
+bash examples/llava_onevision1_5/quick_start/stage_1.5_mid_training_llava_ov_4b.sh
 ```
 
 
@@ -302,7 +302,7 @@ Download LLaVA-NeXT-780k-webdataset at [LLaVA-NeXT-780K Dataset](https://hugging
 ```bash
 # ============================================================
 # Convert model to release format
-bash examples/llava_ov_1_5/convert/convert_4b_mcore_to_release.sh \
+bash examples/llava_onevision1_5/convert/convert_4b_mcore_to_release.sh \
 stage_1.5_mid_training_llava_ov_4b/iter_0020000/ \
 stage_1.5_mid_training_llava_ov_4b_release 1 1
 # ============================================================
@@ -311,14 +311,14 @@ AIAK_TRAINING_PATH=/workspace/LLaVA-OneVision-2 \
 DATA_PATH=LLaVA-NeXT-780k-Webdataset \
 TOKENIZER_PATH=LLaVA-OneVision-1.5-4B-stage0 \
 CHECKPOINT_PATH=stage_1.5_mid_training_llava_ov_4b_release \
-bash examples/llava_ov_1_5/quick_start/stage_2_instruct_llava_ov_4b.sh
+bash examples/llava_onevision1_5/quick_start/stage_2_instruct_llava_ov_4b.sh
 ```
 
 
 ### 6. Convert mcore to Hugging Face
 ```bash
 AIAK_TRAINING_PATH=/workspace/LLaVA-OneVision-2 \
-bash examples/llava_ov_1_5/convert/convert_4b_mcore_to_hf.sh \
+bash examples/llava_onevision1_5/convert/convert_4b_mcore_to_hf.sh \
 stage_2_instruct_llava_ov_4b/iter_0003500 \
 LLaVA-OneVision-1.5-4B-3M-Mid-Training-780K-Instruct \
 1 1
@@ -345,7 +345,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch \
 To improve model training efficiency, we implement offline sample packing:
 
 1. Download the [**Mid-Training-85M Dataset**](https://huggingface.co/datasets/lmms-lab/LLaVA-One-Vision-1.5-Mid-Training-85M)
-2. Pack the data into WebDataset format, refer to [**Examples offlinepacking**](examples_offline_packing) and [**Offline Padding-Free Data Packing**](examples/llava_ov_1_5/sample_packing/README.md)
+2. Pack the data into WebDataset format, refer to [**Examples offlinepacking**](examples_offline_packing) and [**Offline Padding-Free Data Packing**](examples/llava_onevision1_5/sample_packing/README.md)
 
 
 ### Instruct
@@ -389,6 +389,13 @@ Thanks so much to all of our amazing contributors!
                 </a>
             </td>
             <td align="center">
+                <a href="https://github.com/mathCrazyy">
+                    <img src="https://avatars.githubusercontent.com/u/20607153?v=4" width="80;" alt="mathCrazyy"/>
+                    <br />
+                    <sub><b>mathCrazyy</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/anxiangsir">
                     <img src="https://avatars.githubusercontent.com/u/31175974?v=4" width="80;" alt="anxiangsir"/>
                     <br />
@@ -403,10 +410,26 @@ Thanks so much to all of our amazing contributors!
                 </a>
             </td>
             <td align="center">
+                <a href="https://github.com/YunyaoYan">
+                    <img src="https://avatars.githubusercontent.com/u/109638667?v=4" width="80;" alt="YunyaoYan"/>
+                    <br />
+                    <sub><b>YunyaoYan</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/FeilongTangmonash">
                     <img src="https://avatars.githubusercontent.com/u/152372878?v=4" width="80;" alt="FeilongTangmonash"/>
                     <br />
                     <sub><b>FeilongTangmonash</b></sub>
+                </a>
+            </td>
+		</tr>
+		<tr>
+            <td align="center">
+                <a href="https://github.com/chengzheng345">
+                    <img src="https://avatars.githubusercontent.com/u/209475443?v=4" width="80;" alt="chengzheng345"/>
+                    <br />
+                    <sub><b>chengzheng345</b></sub>
                 </a>
             </td>
             <td align="center">
@@ -423,27 +446,11 @@ Thanks so much to all of our amazing contributors!
                     <sub><b>Lornatang</b></sub>
                 </a>
             </td>
-		</tr>
-		<tr>
-            <td align="center">
-                <a href="https://github.com/chengzheng345">
-                    <img src="https://avatars.githubusercontent.com/u/209475443?v=4" width="80;" alt="chengzheng345"/>
-                    <br />
-                    <sub><b>chengzheng345</b></sub>
-                </a>
-            </td>
             <td align="center">
                 <a href="https://github.com/killTheHostage">
                     <img src="https://avatars.githubusercontent.com/u/16442720?v=4" width="80;" alt="killTheHostage"/>
                     <br />
                     <sub><b>killTheHostage</b></sub>
-                </a>
-            </td>
-            <td align="center">
-                <a href="https://github.com/mathCrazyy">
-                    <img src="https://avatars.githubusercontent.com/u/20607153?v=4" width="80;" alt="mathCrazyy"/>
-                    <br />
-                    <sub><b>mathCrazyy</b></sub>
                 </a>
             </td>
             <td align="center">

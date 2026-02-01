@@ -11,7 +11,7 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
-from aiak_training_llm.models.llavaov_1_5.llavaov_1_5_layer_spec import (
+from aiak_training_llm.models.llava_onevision1_5.llava_onevision1_5_layer_spec import (
     get_adapeter_layer_with_spec,
     get_qwen_layer_with_te_spec,
 )

@@ -306,7 +306,7 @@ sample_weight:
 
 
 #### VQA Dataset Example 
-An example for automatically processing the LLaVA-One-Vision-1.5-Mid-Training-85 dataset is provided in directory `.../LLaVA-OneVision-1.5/examples/llava_ov_1_5/sample_packing`.
+An example for automatically processing the LLaVA-One-Vision-1.5-Mid-Training-85 dataset is provided in directory `.../LLaVA-OneVision-1.5/examples/llava_onevision1_5/sample_packing`.
 
 > 🚧 Example (A multi-step pipeline for processing custom datasets) coming soon
 

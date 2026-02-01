@@ -19,7 +19,7 @@ from torchvision import transforms
 
 import transformers
 from aiak_training_llm.train.arguments import aiak_extra_train_args_provider, parse_arguments, validate_aiak_extra_args
-from aiak_training_llm.train.sft.sft_llava_onevision2 import model_provider
+from aiak_training_llm.train.pretrain.pretrain_llava_onevision2 import model_provider
 from aiak_training_llm.utils import get_args, initialize_aiak_megatron
 from ds.llavaonevision2.configuration_llava_onevision2 import LlavaOnevision2Config
 from ds.llavaonevision2.modeling_llava_onevision2 import LlavaOnevision2ForConditionalGeneration, LlavaOnevision2Model

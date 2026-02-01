@@ -61,5 +61,7 @@ coverage.xml
 .vscode/
 checkpoints/
 
+.github/copilot-instructions.md
+
 **ckpts/**
 ckpts

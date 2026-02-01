@@ -2,6 +2,7 @@
 
 import os
 from functools import partial
+from typing import Optional, Tuple
 
 import torch
 from megatron.core import mpu, tensor_parallel
@@ -18,7 +19,7 @@ from aiak_training_llm.models.qwen_vl.utils import get_inputs_on_this_cp_rank
 from aiak_training_llm.train.megatron_trainer import MegatronTrainer
 from aiak_training_llm.train.sft.utils import build_sft_data_collator
 from aiak_training_llm.train.trainer_builder import register_model_trainer
-from aiak_training_llm.utils import constants, get_args
+from aiak_training_llm.utils import constants, get_args, get_tokenizer, print_rank_0
 from transformers import DataCollatorForSeq2Seq
 
 
@@ -117,12 +118,9 @@ def get_batch(data_iterator):
     video_grid_thw = None
     imgs = None
     pixel_values_videos = None
-    patch_positions = None
     if has_image:
         imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
         thw = tensor_parallel.broadcast_data(["image_grid_thw"], data, torch.int32)["image_grid_thw"]
-        if data is not None and "patch_positions" in data and data["patch_positions"] is not None:
-            patch_positions = tensor_parallel.broadcast_data(["patch_positions"], data, torch.int64)["patch_positions"]
     if has_video:
         pixel_values_videos = tensor_parallel.broadcast_data(["pixel_values_videos"], data, torch.float32)[
             "pixel_values_videos"
@@ -175,7 +173,6 @@ def get_batch(data_iterator):
         loss_mask,
         attn_mask_type,
         packed_seq_params,
-        patch_positions,
     )
 
 
@@ -256,7 +253,6 @@ def forward_step(data_iterator, model):
             loss_mask,
             attn_mask_type,
             packed_seq_params,
-            patch_positions,
         ) = get_batch(data_iterator)
 
     timers("batch-generator").stop()
@@ -273,7 +269,6 @@ def forward_step(data_iterator, model):
             packed_seq_params,
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
-            patch_positions=patch_positions,
         )
 
     return output_tensor, partial(loss_func, loss_mask)
@@ -291,7 +286,7 @@ def train_valid_test_dataset_provider(train_val_test_num_samples):
 
 
 @register_model_trainer(
-    model_family=[constants.VisionLanguageModelFamilies.LLAVA_ONEVISION2],
+    model_family=[constants.VisionLanguageModelFamilies.LLAVA_ONEVISION1_5],
     training_phase=constants.TrainingPhase.PRETRAIN,
 )
 def default_pretrain_trainer(train_args):

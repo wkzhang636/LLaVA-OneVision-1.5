@@ -9,7 +9,6 @@ from aiak_training_llm.models.llava_onevision2.llava_onevision2_config import (
 )
 from aiak_training_llm.models.llava_onevision2.vision_transformer_block import TransformerBlock
 
-from typing import List, Optional
 
 class PatchEmbed(torch.nn.Module):
     """
@@ -132,7 +131,7 @@ class VideoRotaryEmbeddingSplit466(torch.nn.Module):
         # Concatenate frequencies: [seq_len, half]
         sample_freqs = torch.cat([ft[t_ids], fh[h_ids], fw[w_ids]], dim=-1)
         return sample_freqs
-    
+
     def forward_from_positions(self, patch_positions: torch.Tensor) -> torch.Tensor:
         """
         Compute rotary position embeddings from explicit patch positions.
@@ -315,7 +314,9 @@ class OneVisionEncoderModel(VisionModule):
         """
         self.decoder.set_input_tensor(input_tensor)
 
-    def forward(self, x: torch.Tensor, grid_thw: torch.Tensor, patch_positions: List[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, grid_thw: torch.Tensor, patch_positions: list[torch.Tensor] | None = None
+    ) -> torch.Tensor:
         """
         Forward pass with packed sequence support and 3D RoPE.
 
@@ -349,24 +350,24 @@ class OneVisionEncoderModel(VisionModule):
             # Use provided patch positions (from pre-computed data)
             # patch_positions is [total_patches, 3] with (t, h, w) per patch
             # Need to reorder from row-major to 2x2 block layout for each sample
-            
+
             offset = 0
             for i in range(batch_size):
                 t, h, w = grid_thw[i]
                 t, h, w = t.item(), h.item(), w.item()
                 num_patches = t * h * w
                 tokens_per_sample.append(num_patches)
-                
+
                 # Extract this sample's positions
-                sample_positions = patch_positions[offset:offset + num_patches]
-                
+                sample_positions = patch_positions[offset : offset + num_patches]
+
                 # Convert positions from row-major to 2x2 block layout
                 sample_positions = convert_positions_to_block_layout(sample_positions, t, h, w, sms)
-                
+
                 # Compute RoPE from reordered positions
                 sample_freqs = self.video_rope.forward_from_positions(sample_positions)
                 all_rotary_pos_emb.append(sample_freqs)
-                
+
                 offset += num_patches
         else:
             # Generate positions from grid_thw (original behavior)

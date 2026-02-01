@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import torch
-from torch.nn.functional import gelu
 
 from aiak_training_llm.models.factory import register_model_config
 from aiak_training_llm.utils.constants import VisionLanguageModelFamilies
@@ -14,14 +13,14 @@ class AdapterConfig:
     """
 
     normalization: str
-    activation_func: torch.nn.Module = gelu
+    activation_func: torch.nn.Module = torch.nn.functional.gelu
     add_bias_linear: bool = False
     layernorm_epsilon: float = 1e-06
 
 
 @dataclass
-class LlavaOnevision2Config:
-    """config for llava one vision 2 model"""
+class LlavaOnevision1_5Config:
+    """config for llava one vision 1.5 model"""
 
     num_layers: int
     hidden_size: int
@@ -49,10 +48,10 @@ class LlavaOnevision2Config:
     moe_ffn_hidden_size: int = None
 
 
-@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION2, model_arch="llava-onevision2-2b")
-def llava_onevision2_2b():
-    """llava-onevision2-2b"""
-    return LlavaOnevision2Config(
+@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION1_5, model_arch="llava-onevision1.5-2b")
+def llava_one_vision_1_5_2b():
+    """llava-onevision1.5-2b"""
+    return LlavaOnevision1_5Config(
         num_layers=28,
         hidden_size=2048,
         ffn_hidden_size=6144,
@@ -68,10 +67,10 @@ def llava_onevision2_2b():
     )
 
 
-@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION2, model_arch="llava-onevision2-3b")
-def llava_onevision2_3b():
-    """llava-onevision2-3b"""
-    return LlavaOnevision2Config(
+@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION1_5, model_arch="llava-onevision1.5-3b")
+def llava_one_vision_1_5_3b():
+    """llava-onevision1.5-3b"""
+    return LlavaOnevision1_5Config(
         num_layers=36,
         hidden_size=2048,
         ffn_hidden_size=11008,
@@ -84,10 +83,10 @@ def llava_onevision2_3b():
     )
 
 
-@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION2, model_arch="llava-onevision2-4b")
-def llava_onevision2_4b():
-    """llava-onevision2-4b"""
-    return LlavaOnevision2Config(
+@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION1_5, model_arch="llava-onevision1.5-4b")
+def llava_one_vision_1_5_4b():
+    """llava-onevision1.5-4b"""
+    return LlavaOnevision1_5Config(
         num_layers=36,
         hidden_size=2560,
         ffn_hidden_size=9728,
@@ -104,11 +103,11 @@ def llava_onevision2_4b():
 
 
 @register_model_config(
-    model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION2, model_arch="llava-onevision2-30b-a3b"
+    model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION1_5, model_arch="llava-onevision1.5-30b-a3b"
 )
-def llava_onevision2_30b_a3b():
-    """llava-onevision2-30b-a3b"""
-    return LlavaOnevision2Config(
+def llava_one_vision_1_5_30b_a3b():
+    """llava-onevision1.5-30b-a3b"""
+    return LlavaOnevision1_5Config(
         num_layers=48,
         hidden_size=2048,
         ffn_hidden_size=6144,
@@ -126,10 +125,10 @@ def llava_onevision2_30b_a3b():
     )
 
 
-@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION2, model_arch="llava-onevision2-8b")
-def llava_onevision2_8b():
-    """llava-onevision2-8b"""
-    return LlavaOnevision2Config(
+@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION1_5, model_arch="llava-onevision1.5-8b")
+def llava_one_vision_1_5_8b():
+    """llava-onevision1.5-8b"""
+    return LlavaOnevision1_5Config(
         num_layers=36,
         hidden_size=4096,
         ffn_hidden_size=12288,
@@ -145,10 +144,12 @@ def llava_onevision2_8b():
     )
 
 
-@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION2, model_arch="llava-onevision2-32b")
-def llava_onevision2_32b():
-    """llava-onevision2-32b"""
-    return LlavaOnevision2Config(
+@register_model_config(
+    model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION1_5, model_arch="llava-onevision1.5-32b"
+)
+def llava_one_vision_1_5_32b():
+    """llava-onevision1.5-32b"""
+    return LlavaOnevision1_5Config(
         num_layers=64,
         hidden_size=5120,
         ffn_hidden_size=25600,
@@ -164,10 +165,12 @@ def llava_onevision2_32b():
     )
 
 
-@register_model_config(model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION2, model_arch="llava-onevision2-14b")
-def llava_onevision2_14b():
-    """llava-onevision2-14b"""
-    return LlavaOnevision2Config(
+@register_model_config(
+    model_family=VisionLanguageModelFamilies.LLAVA_ONEVISION1_5, model_arch="llava-onevision1.5-14b"
+)
+def llava_one_vision_1_5_14b():
+    """llava-onevision1.5-14b"""
+    return LlavaOnevision1_5Config(
         num_layers=40,
         hidden_size=5120,
         ffn_hidden_size=17408,

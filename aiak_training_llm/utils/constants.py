@@ -1,7 +1,5 @@
 """constants"""
 
-from typing import List
-
 IGNORE_INDEX = -100
 
 ######### dataset ########
@@ -21,12 +19,14 @@ SFT_SUPPORT_DATA_TYPE = {
 
 class SFTDataFormats(object):
     """sft data formats"""
+
     ALPACA = "alpaca"
     SHAREGPT = "sharegpt"
 
 
 class DataRoles(object):
     """data roles"""
+
     USER = "user"
     ASSISTANT = "assistant"
     OBSERVATION = "observation"
@@ -35,7 +35,8 @@ class DataRoles(object):
 
 
 class Placeholder(object):
-    """ Placeholders """
+    """Placeholders"""
+
     IMAGE = "<image>"
     VIDEO = "<video>"
 
@@ -43,6 +44,7 @@ class Placeholder(object):
 ######## training args ########
 class TrainingPhase(object):
     """Training phase"""
+
     PRETRAIN = "pretrain"
     SFT = "sft"
 
@@ -51,15 +53,17 @@ class TrainingPhase(object):
 # Using List[str] instead of list[str] to ensure compatibility with older versions of Python(<3.9)
 class _BaseFamilies(object):
     @classmethod
-    def names(cls) -> List[str]:
+    def names(cls) -> list[str]:
         """Return a list of all string names defined in the class and its subclasses"""
-        string_names = [value for name, value in vars(cls).items()
-                        if isinstance(value, str) and not name.startswith("__")]
+        string_names = [
+            value for name, value in vars(cls).items() if isinstance(value, str) and not name.startswith("__")
+        ]
         return string_names
 
 
 class LanguageModelFamilies(_BaseFamilies):
     """Language model families"""
+
     LLAMA = "llama"
     LLAMA2 = "llama2"
     LLAMA3 = "llama3"
@@ -77,14 +81,16 @@ class LanguageModelFamilies(_BaseFamilies):
 
 class VideoLanguageModelFamilies(_BaseFamilies):
     """Video language model families"""
+
     STDIT = "stdit"
     STDIT3 = "stdit3"
 
 
 class VisionLanguageModelFamilies(_BaseFamilies):
     """Vision language model families"""
+
     COGVLM2 = "cogvlm2"
     QWEN2_VL = "qwen2_vl"
     QWEN2_5_VL = "qwen2_5_vl"
-    LLAVA_OV_1_5 = "llava_ov_1_5"
-    LlavaOnevision2 = "llava_onevision2"
+    LLAVA_ONEVISION1_5 = "llava_onevision1_5"
+    LLAVA_ONEVISION2 = "llava_onevision2"

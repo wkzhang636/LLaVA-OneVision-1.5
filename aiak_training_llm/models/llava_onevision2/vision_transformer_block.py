@@ -1,19 +1,10 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
-"""transformer block"""
-
-import re
-import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
 
 import torch
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_block import TransformerBlock as MegatronTransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 from torch import Tensor
 
@@ -39,7 +30,7 @@ class TransformerBlock(MegatronTransformerBlock):
         rotary_pos_sin: Tensor = None,
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
-        packed_seq_params: List[PackedSeqParams] = None,
+        packed_seq_params: list[PackedSeqParams] | None = None,
         **kwargs,
     ):
         """forward with list of packed params"""
@@ -177,7 +168,7 @@ class TransformerBlock(MegatronTransformerBlock):
         rotary_pos_sin: Tensor = None,
         attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
-        packed_seq_params: List[PackedSeqParams] = None,
+        packed_seq_params: list[PackedSeqParams] | None = None,
         **kwargs,
     ) -> dict:
         """

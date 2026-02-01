@@ -1,3 +1,5 @@
+"""llava onevision 1.5 model provider"""
+
 from copy import deepcopy
 from dataclasses import asdict
 
@@ -5,26 +7,30 @@ from megatron.core import mpu
 from megatron.core.transformer.spec_utils import import_module
 
 from aiak_training_llm.models.factory import register_model_provider
-from aiak_training_llm.models.llava_onevision2.llava_onevision2_config import get_adapeter_config, get_vision_config
-from aiak_training_llm.models.llava_onevision2.llava_onevision2_layer_spec import (
+from aiak_training_llm.models.llava_onevision1_5.llava_onevision1_5_config import (
+    get_adapeter_config,
+    get_vision_config,
+)
+from aiak_training_llm.models.llava_onevision1_5.llava_onevision1_5_layer_spec import (
     get_adapeter_layer_with_spec,
     get_qwen_layer_with_te_spec,
     get_vision_layer_with_spec,
 )
-from aiak_training_llm.models.llava_onevision2.llava_onevision2_model import LlavaOnevision2
 from aiak_training_llm.utils import build_transformer_config, get_args, print_rank_0
 from aiak_training_llm.utils.constants import VisionLanguageModelFamilies
 
+from .llava_onevision1_5_model import LlavaOnevision1_5
 
-@register_model_provider(model_family=[VisionLanguageModelFamilies.LLAVA_ONEVISION2])
-def llavaov_2_model_provider(
+
+@register_model_provider(model_family=[VisionLanguageModelFamilies.LLAVA_ONEVISION1_5])
+def rice_vl_model_provider(
     pre_process: bool = True,
     post_process: bool = True,
     add_encoder: bool = True,
     add_decoder: bool = True,
     parallel_output: bool = True,
-) -> LlavaOnevision2:
-    """Builds the LLavaOneVision2 model.
+) -> LlavaOnevision1_5:
+    """Builds the llava-onevision1.5 model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
@@ -32,7 +38,7 @@ def llavaov_2_model_provider(
         parallel_output (bool): whether to allgather the output logits
 
     Returns:
-        LlavaOnevision2: The returned model
+        RiceVLModel: The returned model
     """
     args = get_args()
 
@@ -91,7 +97,7 @@ def llavaov_2_model_provider(
         vision_layer_spec = get_vision_layer_with_spec()
         language_layer_spec = get_qwen_layer_with_te_spec(language_config)
 
-    model = LlavaOnevision2(
+    model = LlavaOnevision1_5(
         language_config=language_config,
         vision_config=vision_config,
         adapter_config=adapter_config,
