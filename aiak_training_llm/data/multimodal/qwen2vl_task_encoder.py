@@ -193,19 +193,21 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                 t_val, h_val, w_val = image_grid_thw[img_idx].tolist()
                 num_patches += h_val * w_val
             pixel_values_images = [mm_inputs["pixel_values"]]
-            if len(patch_positions) == 0 and len(image_grid_thw) == 1:
+            if len(patch_positions) == 0:
                 # Generate default patch_positions from image_grid_thw, with t=0 for all patches
                 # image_grid_thw: [num_images, 3], each row is (t, h, w)
                 for img_idx in range(len(image_grid_thw)):
                     t_val, h_val, w_val = image_grid_thw[img_idx].tolist()
-                    num_patches = t_val * h_val * w_val
+                    cur_num_patches = t_val * h_val * w_val
                     # Generate (t, h, w) coordinates in row-major order, t is fixed to 0
                     h_coords = torch.arange(h_val, dtype=torch.int64).repeat_interleave(w_val).repeat(t_val)
                     w_coords = torch.arange(w_val, dtype=torch.int64).repeat(h_val).repeat(t_val)
-                    t_coords = torch.zeros(num_patches, dtype=torch.int64)
+                    t_coords = torch.zeros(cur_num_patches, dtype=torch.int64)
                     # Stack into [num_patches, 3] tensor
                     img_patch_positions = torch.stack([t_coords, h_coords, w_coords], dim=1)
                     patch_positions.append(img_patch_positions)
+            else:
+                image_grid_thw = torch.tensor([[len(image_grid_thw),image_grid_thw[0][1],image_grid_thw[0][2]]])
             patch_positions_sum = sum(len(p) for p in patch_positions)
             if num_patches != patch_positions_sum:
                 raise SampleException(
