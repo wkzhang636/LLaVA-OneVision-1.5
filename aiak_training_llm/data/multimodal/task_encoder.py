@@ -203,7 +203,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                             })
 
                         return messages
-                    sample_images = sample.images[idx] if isinstance(sample.images[idx], list) else [sample.images[idx]] if sample.images[idx] else None
+                    sample_images = (
+                        sample.images[idx]
+                        if isinstance(sample.images[idx], list)
+                        else [sample.images[idx]] if sample.images[idx] else None
+                    )
+                    if isinstance(sample_images, list) and len(sample_images) == 0:
+                        sample_images = None
 
                     sample_patch_positions = None
                     if hasattr(sample, 'patch_positions') and sample.patch_positions is not None and idx < len(sample.patch_positions):
@@ -217,6 +223,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                     if isinstance(cur_caption, str):
                         cur_caption = [cur_caption]
 
+                    # Extract per-sample fps if available
+                    sample_fps = None
+                    if hasattr(sample, 'fps') and sample.fps is not None and idx < len(sample.fps):
+                        sample_fps = sample.fps[idx]
+
                     cur_capsample = MultiMixQASample(
                         __key__=f"{sample.__key__}.img{idx:03d}_jpg",
                         __restore_key__=sample.__restore_key__,
@@ -226,7 +237,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                         video=None,
                         system=None,
                         image=sample_images,
-                        patch_positions=sample_patch_positions
+                        patch_positions=sample_patch_positions,
+                        fps=sample_fps,
                     )
                     l_Qwen2VLImageTaskSample.append(self.encode_multi_mix_qa(cur_capsample))
                 else:

@@ -1,7 +1,7 @@
 """ PackedCaptioningSample """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 from megatron.energon.flavors.base_dataset import Sample
 import torch
 import numpy as np
@@ -14,3 +14,4 @@ class PackedCaptioningSample(Sample):
     prompts: Optional[List[str]]
     captions: List[str]
     patch_positions: Optional[List[List[np.ndarray]]] = None  # [sample_idx][img_idx] -> np.ndarray
+    fps: Optional[List[Optional[Union[float, int]]]] = None   # [sample_idx] -> fps or None

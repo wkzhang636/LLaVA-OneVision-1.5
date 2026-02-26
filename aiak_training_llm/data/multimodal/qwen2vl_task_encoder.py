@@ -321,7 +321,8 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         patch_positions = []
         timestamp_tokens = None
 
-        if raw_image is not None:
+        has_image_inputs = raw_image is not None and len(raw_image) > 0
+        if has_image_inputs:
             image = raw_image
 
         if raw_patch_positions is not None:
@@ -345,17 +346,34 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                     timestamp_tokens.append(time_token)
 
         messages, mm_inputs = self.chat_template.mm_plugin.process_messages(
-            messages, image if image is not None else [], video if raw_video is not None else [], self.processor
+            messages,
+            image,
+            video if raw_video is not None else [],
+            self.processor,
         )
 
-        if raw_image is not None:
-            image_grid_thw = mm_inputs["image_grid_thw"]
+        if has_image_inputs:
+            image_grid_thw = mm_inputs.get("image_grid_thw")
+            if image_grid_thw is None:
+                raise SampleException(
+                    "Missing `image_grid_thw` in multimodal inputs:\n"
+                    f"- num_raw_image: {len(raw_image)}\n"
+                    f"- mm_input_keys: {list(mm_inputs.keys())}\n"
+                    f"- has_image_placeholder: {any('<image>' in msg.get('content', '') for msg in messages)}"
+                )
             # get image patch num:
             num_patches = 0
             for img_idx in range(len(image_grid_thw)):
                 t_val, h_val, w_val = image_grid_thw[img_idx].tolist()
                 num_patches += h_val * w_val
-            pixel_values_images = [mm_inputs["pixel_values"]]
+            pixel_values = mm_inputs.get("pixel_values")
+            if pixel_values is None:
+                raise SampleException(
+                    "Missing `pixel_values` in multimodal inputs:\n"
+                    f"- num_raw_image: {len(raw_image)}\n"
+                    f"- mm_input_keys: {list(mm_inputs.keys())}"
+                )
+            pixel_values_images = [pixel_values]
             if len(patch_positions) == 0:
                 # Generate default patch_positions from image_grid_thw, with t=0 for all patches
                 # image_grid_thw: [num_images, 3], each row is (t, h, w)
@@ -490,8 +508,8 @@ class Qwen2VLTaskEncoder(TaskEncoder):
     def encode_multi_mix_qa(self, sample: MultiMixQASample) -> ImageTaskSample:
         """Encode sample in Qwen2VL style."""
         if sample.fps is not None:
-            pass
-            # print(f"Sample key: {sample.__key__}, FPS: {sample.fps}")
+            # pass
+            print(f"Sample key: {sample.__key__}, FPS: {sample.fps}")
 
         if self.args.training_phase == constants.TrainingPhase.SFT:
             num_tiles = []

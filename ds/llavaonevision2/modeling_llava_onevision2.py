@@ -417,18 +417,24 @@ def convert_rope_to_block_layout_by_positions(
     grid_thw: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Convert RoPE from row-major order to 2x2 block layout, grouping by temporal index.
+    Convert RoPE from row-major order to 2x2 block layout.
 
-    This function automatically groups patches by their temporal index (t) from patch_positions,
-    then applies 2x2 spatial reordering within each temporal group.
+    When grid_thw is provided, use it directly to determine the dense canvas/frame
+    dimensions (t, h, w) for the spatial reorder. This is correct for:
+      - Normal video:  grid_thw = [[T, H, W]]
+      - Codec video:   grid_thw = [[n_canvases, hb, wb]]
+      - Images:        grid_thw = [[1, H1, W1], [1, H2, W2], ...]
 
-    Optimized version: if all frames have the same spatial size, use vectorized operations.
+    The block layout reorder is purely spatial (standard raster -> 2x2 block raster)
+    and depends only on canvas (h, w), NOT on per-patch frame_id.
+
+    Falls back to position-based frame_id grouping only when grid_thw is not available.
 
     Args:
         freqs: RoPE frequencies in row-major order, shape [seq_len, half]
         patch_positions: Patch positions tensor, shape [seq_len, 3] with [t, h, w] for each patch
         spatial_merge_size: size of spatial merge blocks (default: 2)
-        grid_thw: Optional grid_thw tensor for reliable h, w extraction
+        grid_thw: Grid sizes tensor of shape [num_samples, 3] with [t, h, w] for each sample.
 
     Returns:
         torch.Tensor: RoPE frequencies in 2x2 block order, same shape [seq_len, half]
@@ -437,54 +443,69 @@ def convert_rope_to_block_layout_by_positions(
     if sms == 1:
         return freqs
 
+    # ---- Primary path: use grid_thw directly (correct for all cases) ----
+    if grid_thw is not None:
+        num_samples = grid_thw.shape[0]
+
+        # Fast path: single sample (most common)
+        if num_samples == 1:
+            t = grid_thw[0, 0].item()
+            h = grid_thw[0, 1].item()
+            w = grid_thw[0, 2].item()
+            return convert_rope_to_block_layout(freqs, t=t, h=h, w=w, spatial_merge_size=sms)
+
+        # Check if all samples share the same (h, w) — common for video frames
+        all_same_hw = (
+            torch.all(grid_thw[:, 1] == grid_thw[0, 1]).item()
+            and torch.all(grid_thw[:, 2] == grid_thw[0, 2]).item()
+        )
+        if all_same_hw:
+            total_t = grid_thw[:, 0].sum().item()
+            h = grid_thw[0, 1].item()
+            w = grid_thw[0, 2].item()
+            return convert_rope_to_block_layout(freqs, t=total_t, h=h, w=w, spatial_merge_size=sms)
+
+        # Slow path: different spatial sizes per sample (e.g. mixed image resolutions)
+        result = torch.empty_like(freqs)
+        offset = 0
+        for i in range(num_samples):
+            t = grid_thw[i, 0].item()
+            h = grid_thw[i, 1].item()
+            w = grid_thw[i, 2].item()
+            n = int(t * h * w)
+            result[offset:offset + n] = convert_rope_to_block_layout(
+                freqs[offset:offset + n], t=t, h=h, w=w, spatial_merge_size=sms
+            )
+            offset += n
+        return result
+
+    # ---- Fallback path: no grid_thw, group by frame_id from patch_positions ----
     half = freqs.shape[-1]
     seq_len = freqs.shape[0]
 
-    # Get temporal indices
     t_indices = patch_positions[:, 0]
-
-    # Find unique t values and their counts (preserving order)
     unique_t, inverse_indices, counts = torch.unique_consecutive(t_indices, return_inverse=True, return_counts=True)
-
     num_groups = unique_t.shape[0]
 
-    # Fast path: single image with grid_thw available
-    if num_groups == 1 and grid_thw is not None:
-        height = grid_thw[0, 1].item()
-        width = grid_thw[0, 2].item()
-        return convert_rope_to_block_layout(freqs, t=1, h=height, w=width, spatial_merge_size=sms)
-
-    # Fast path: single image, square
+    # Single image, square
     if num_groups == 1:
         hw = int(seq_len**0.5)
         if hw * hw == seq_len:
             return convert_rope_to_block_layout(freqs, t=1, h=hw, w=hw, spatial_merge_size=sms)
 
-    # Check if all groups have the same size (common case for videos)
-    # This allows vectorized processing
+    # All groups same size
     first_count = counts[0].item()
     all_same_size = torch.all(counts == first_count).item()
 
     if all_same_size:
-        # Vectorized path: all frames have same spatial size
         group_size = first_count
         hw = int(group_size**0.5)
-
         if hw * hw == group_size:
-            # Square frames: use fully vectorized convert_rope_to_block_layout
-            # Reshape freqs to [num_groups, h, w, half] and process as batch
             return convert_rope_to_block_layout(freqs, t=num_groups, h=hw, w=hw, spatial_merge_size=sms)
-        elif grid_thw is not None:
-            # Non-square but have grid_thw: get h, w from grid_thw
-            height = grid_thw[0, 1].item()
-            width = grid_thw[0, 2].item()
-            return convert_rope_to_block_layout(freqs, t=num_groups, h=height, w=width, spatial_merge_size=sms)
 
-    # Slow path: variable frame sizes, process each group separately
-    # Pre-compute cumulative offsets to avoid repeated slicing
+    # Variable frame sizes
     cum_counts = torch.cumsum(counts, dim=0)
     start_indices = torch.cat([torch.tensor([0], device=counts.device), cum_counts[:-1]])
-
     result_freqs = torch.empty_like(freqs)
 
     for group_idx in range(num_groups):
@@ -492,14 +513,12 @@ def convert_rope_to_block_layout_by_positions(
         group_size = counts[group_idx].item()
         end_idx = start_idx + group_size
 
-        # Infer spatial dimensions
         hw = int(group_size**0.5)
         if hw * hw == group_size:
             h, w = hw, hw
         else:
             h, w = _infer_hw_from_positions(patch_positions[start_idx:end_idx], sms)
 
-        # Apply block layout conversion
         result_freqs[start_idx:end_idx] = convert_rope_to_block_layout(
             freqs[start_idx:end_idx], t=1, h=h, w=w, spatial_merge_size=sms
         )

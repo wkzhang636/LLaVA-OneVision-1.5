@@ -6,9 +6,8 @@ Expected JSONL fields (per line):
 - id: str
 - messages: List[{"role": "user|assistant|system", "content": str}]
 - images: List[path] (frame images or still images)
-- image_source: Optional[path] (video path, used to infer fps if missing)
 - patch_positions: Optional[List[path]] (npy files)
-- fps: Optional[float|int]
+- fps: float|int (required)
 
 This script writes WebDataset shards and a minimal Megatron-Energon config
 for MultiMixQASample, with an auto-generated sample_loader.
@@ -28,11 +27,6 @@ from pathlib import Path
 import webdataset as wds
 import yaml
 from tqdm import tqdm
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
 
 
 try:
@@ -159,15 +153,16 @@ def _normalize_list(value: object | None) -> list[str]:
     return list(value)
 
 
-def _build_sample(entry: dict, idx: int, image_root: str | None, sample_prefix: str) -> dict | None:
-    """Build one sample; return None when fps inference from image_source fails."""
+def _build_sample(entry: dict, idx: int, image_root: str | None, sample_prefix: str) -> dict:
+    """Build one sample."""
     sample_id = entry.get("id") or f"{sample_prefix}{idx}"
+    sample_id = sample_id.replace(".", "_")
     messages = entry.get("messages", [])
 
     images = _normalize_list(entry.get("images") or entry.get("image"))
     patch_positions = _normalize_list(entry.get("patch_positions"))
 
-    sample = {"__key__": sample_id}
+    sample = {"__key__": str(sample_id)}
 
     image_keys: list[str] = []
     for img_idx, img_path in enumerate(images):
@@ -189,38 +184,15 @@ def _build_sample(entry: dict, idx: int, image_root: str | None, sample_prefix: 
         patch_positions_keys.append(key)
 
     fps = entry.get("fps")
-    if fps is None and entry.get("image_source"):
-        image_source = entry["image_source"]
-        video_path = resolve_path(image_source, image_root)
-        try:
-            if not os.path.exists(video_path):
-                raise FileNotFoundError(f"Video not found for fps extraction: {video_path}")
-            if cv2 is None:
-                raise ImportError("OpenCV (cv2) is required to infer fps from image_source.")
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                raise ValueError(f"Failed to open video for fps extraction: {video_path}")
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
-            if fps is None or fps <= 0:
-                raise ValueError(f"Failed to read valid fps from video: {video_path}")
-        except Exception as exc:
-            logger.warning(
-                "Skip sample %s: failed to infer fps from %s (%s): %s",
-                sample_id,
-                image_source,
-                type(exc).__name__,
-                exc,
-            )
-            return None
+    if fps is None:
+        raise ValueError(f"Missing required field 'fps' in sample: {sample_id}")
 
     payload = {
         "messages": messages,
         "image_keys": image_keys,
+        "fps": fps,
     }
-    if fps is not None:
-        payload["fps"] = fps
-
+    logging.info(payload["fps"])
     if patch_positions_keys:
         payload["patch_positions_keys"] = patch_positions_keys
     sample["json"] = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -248,8 +220,6 @@ def _process_chunk(
     with wds.ShardWriter(tar_pattern, maxcount=maxcount, maxsize=maxsize, verbose=0) as shard_writer:
         for idx, entry in enumerate(iter_jsonl(chunk_path)):
             sample = _build_sample(entry, idx, image_root, sample_prefix)
-            if sample is None:
-                continue
             shard_writer.write(sample)
             count += 1
             if _COUNTER is not None and count % 50 == 0:
