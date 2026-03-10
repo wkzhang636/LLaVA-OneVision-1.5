@@ -494,6 +494,10 @@ class MCoreSavePlanner(DefaultSavePlanner):
         """Merges MCore data for all plans."""
         global_plan, metadata = super().create_global_plan(all_plans)
         metadata.mcore_data = dict(ChainMap(*(plan.mcore_data for plan in all_plans)))
+        if metadata.planner_data is None:
+            metadata.planner_data = dict(
+                ChainMap(*(plan.planner_data for plan in all_plans if plan.planner_data))
+            )
         return global_plan, metadata
 
     def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
@@ -872,8 +876,57 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         mcore_state_dict = restore_nd_flattened_tensors_formulation(
             mcore_state_dict, formulation_restore_data
         )
+        
+        # Handle vocab embedding padding for shape mismatch
+        mcore_state_dict = self._handle_vocab_embedding_padding(
+            mcore_state_dict, orig_sharded_state_dict
+        )
+
         return mcore_state_dict
 
+    def _handle_vocab_embedding_padding(self, state_dict, sharded_state_dict):
+        """Handle vocab embedding padding when checkpoint vocab size is smaller than model config.
+        
+        This function automatically pads word_embeddings.weight and output_layer.weight
+        when the checkpoint vocab size is smaller than the expected padded vocab size.
+        """
+        try:
+            from megatron.training.global_vars import get_args
+            args = get_args()
+        except Exception:
+            return state_dict
+        
+        # Check if we need to handle vocab padding
+        vocab_size = getattr(args, 'vocab_size_in_config_file', None)
+        padded_vocab_size = getattr(args, 'padded_vocab_size', None)
+        make_vocab_size_divisible_by = getattr(args, 'make_vocab_size_divisible_by', 128)
+        
+        if vocab_size is None or padded_vocab_size is None:
+            return state_dict
+        
+        if padded_vocab_size <= vocab_size:
+            return state_dict
+        
+        padding_size = padded_vocab_size - vocab_size
+        hidden_size = getattr(args, 'hidden_size', None)
+        
+        if hidden_size is None:
+            return state_dict
+        
+        for key, tensor in list(state_dict.items()):
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            
+            # Check if this is an embedding layer that needs padding
+            if 'language_model.embedding.word_embeddings.weight' in key or 'language_model.output_layer.weight' in key:
+                if tensor.shape[0] == vocab_size and tensor.shape[1] == hidden_size:
+                    logger.info(f"Padding {key} from {tensor.shape} to [{padded_vocab_size}, {hidden_size}]")
+                    # Use the last row as padding (replicate the last embedding)
+                    pad = tensor[-1].unsqueeze(0).expand(padding_size, -1).clone()
+                    state_dict[key] = torch.cat([tensor, pad], dim=0)
+        
+        return state_dict
+        
     def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):
         """Uses tensors metadata stored in the metadata file."""
         if metadata is None:
@@ -957,7 +1010,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if k.startswith(key_prefix):
                 continue
             new_state_dict_metadata[k] = original_metadata.state_dict_metadata[k]
-        for k in original_metadata.planner_data.keys():
+        # for k in original_metadata.planner_data.keys():
+        for k in (original_metadata.planner_data or {}).keys():
             if k.startswith(key_prefix):
                 continue
             new_planner_data[k] = original_metadata.planner_data[k]
