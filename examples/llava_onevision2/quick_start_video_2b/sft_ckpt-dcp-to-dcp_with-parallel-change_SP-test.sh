@@ -1,4 +1,4 @@
-TP="${1:-1}"
+TP="${1:-4}"
 PP="${2:-1}"
 SEQ_LEN="${3:-20480}"
 MBS="${4:-1}"
@@ -15,9 +15,12 @@ TOKENIZER_PATH=${TOKENIZER_PATH:-"/ov2/pretrain_models/preprocessor/preprocessor
 # CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/ov2/feilong/checkpoint_release/32_frames_llava_next_video_2M/"}  # load torch checkpoint
 # CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/ov2/feilong/checkpoint_release/32_frames_llava_next_video_2M/release"}  # torch_dist random initialization
 CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/workspace/LLaVA-OneVision-2.0/examples/llava_onevision2/quick_start_video_2b/output/sft_ckpt-dcp-to-dcp_continue_train"} # load dcp checkpoint
+# CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/workspace/train_ov2/LLaVA-OneVision-2.0/examples/llava_onevision2/quick_start_video_2b/output/sft_ckpt-dcp-to-dcp_with-parallel-change_SP-test"}
 
 export PYDEVD_DISABLE_FILE_VALIDATION=1
 export TE_EXTRA_STATE_MISSING_CHECK=1
+export PATCH_EMBED_TYPE="${PATCH_EMBED_TYPE:-LINEAR}"   # TP_LINEAR, CONV2D, LINEAR
+export SCATTER_BEFORE_PATCH_EMBED="${SCATTER_BEFORE_PATCH_EMBED:-0}"  # 0: original path, 1: scatter before patch_embed
 # export TORCHRUN_DEBUG=1
 #! /bin/bash
 # The script needs to be run on at least 1 nodes.
@@ -144,9 +147,10 @@ TRAINING_ARGS=(
     --initial-loss-scale 65536
     --bf16
     --save "$SAVE_CKPT_PATH"
-    --save-interval 20
+    --save-interval 50
     --ckpt-format torch_dist
     --no-load-rng
+    --override-opt_param-scheduler
     --dataloader-save "${SAVE_CKPT_PATH}/dataloader"
     --auto-detect-ckpt-format
     --ckpt-fully-parallel-load

@@ -1,10 +1,17 @@
+import logging
+from copy import deepcopy
+from typing import Optional, Tuple
+
 import torch
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
 
 from aiak_training_llm.models.llava_onevision2.llava_onevision2_config import (
     VisionConfig,
@@ -13,9 +20,258 @@ from aiak_training_llm.models.llava_onevision2.vision_transformer_block import T
 
 import os
 TE_EXTRA_STATE_CHECK = int(os.environ.get("TE_EXTRA_STATE_MISSING_CHECK",0))==1
+_SCATTER_BEFORE_PATCH_EMBED = os.environ.get("SCATTER_BEFORE_PATCH_EMBED", "0") == "1"
 if TE_EXTRA_STATE_CHECK:
     from aiak_training_llm.utils.te_env import add_te_filter_module_and_op
-    from megatron.training.fix_te import _load_state_dict_hook_ignore_extra_state 
+    from megatron.training.fix_te import _load_state_dict_hook_ignore_extra_state
+
+logger = logging.getLogger(__name__)
+
+
+class ParallelPatchEmbed(torch.nn.Module):
+    """
+    Image to Patch Embedding module (Tensor-Parallel version).
+
+    Converts input images into patch embeddings using a ColumnParallelLinear
+    projection instead of Conv2d, enabling tensor parallelism over the
+    output (embed_dim) dimension.
+
+    The ColumnParallelLinear shards along the output dimension (dim 0), so each
+    TP rank holds ``[embed_dim // tp_size, in_channels * patch_size * patch_size]``.
+    ``gather_output=True`` reassembles the full ``[total_patches, embed_dim]``
+    output on every rank, which is required because ``pre_layernorm`` and the
+    subsequent ``_scatter_for_sequence_parallel`` expect the full hidden vector.
+
+    A **load-state-dict pre-hook** handles backward compatibility with old
+    checkpoints that stored the patch embedding as a Conv2d weight
+    (4-D tensor ``[O, C, H, W]``): the hook reshapes it to 2-D
+    ``[O, C*H*W]`` and, if the loaded weight is unsharded, slices the
+    local TP-rank shard automatically.
+
+    Args:
+        patch_size (int): Size of each square patch. Default: 14.
+        in_channels (int): Number of input image channels. Default: 3.
+        embed_dim (int): Dimension of patch embeddings. Default: 1024.
+        config: Megatron TransformerConfig (or ModelParallelConfig).
+            A **copy** with ``sequence_parallel=False`` is created internally,
+            because ``ColumnParallelLinear`` asserts that ``gather_output`` and
+            ``sequence_parallel`` cannot both be True, and the patch embed runs
+            before the sequence-parallel scatter point.
+    """
+
+    def __init__(
+        self,
+        patch_size: int = 14,
+        in_channels: int = 3,
+        embed_dim: int = 1024,
+        config=None,
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+
+        # CRITICAL: copy config and force sequence_parallel=False.
+        # ColumnParallelLinear asserts that gather_output=True and
+        # sequence_parallel=True cannot coexist. The patch embed runs
+        # BEFORE the SP scatter point, so its input is the full replicated
+        # sequence — SP must be disabled here.
+        patch_config = deepcopy(config)
+        patch_config.sequence_parallel = False
+
+        linear_input_size = in_channels * patch_size * patch_size
+        self.proj = ColumnParallelLinear(
+            linear_input_size,
+            embed_dim,
+            config=patch_config,
+            init_method=torch.nn.init.xavier_uniform_,
+            bias=False,
+            gather_output=True,
+        )
+
+        # Register a pre-hook to handle old Conv2d checkpoint weights.
+        self._register_load_state_dict_pre_hook(self._conv2d_to_linear_hook)
+
+    def _conv2d_to_linear_hook(self, state_dict, prefix, *args, **kwargs):
+        """Reshape Conv2d weights to Linear and handle TP shard slicing.
+
+        This hook is called before ``load_state_dict`` copies values into
+        the module's parameters.  It detects 4-D Conv2d weights
+        ``[O, C, H, W]`` and reshapes them to ``[O, C*H*W]``.
+        If the loaded weight is full (unsharded), it slices the local
+        TP-rank portion so that it fits the ColumnParallelLinear partition.
+
+        When DCP (distributed checkpoint) has already loaded the correct
+        TP shard, the weight will already match the module's parameter
+        shape — in that case this hook is a no-op.
+        """
+        weight_key = f"{prefix}proj.weight"
+        if weight_key not in state_dict:
+            return
+
+        w = state_dict[weight_key]
+
+        # --- Step 1: Conv2d 4-D → Linear 2-D ---
+        if w.dim() == 4:
+            # Conv2d shape: [embed_dim, in_channels, patch_size, patch_size]
+            out_dim = w.shape[0]
+            w = w.reshape(out_dim, -1)
+            logger.info(
+                f"ParallelPatchEmbed: reshaped Conv2d weight from 4D to 2D: {list(state_dict[weight_key].shape)} -> {list(w.shape)}"
+            )
+            state_dict[weight_key] = w
+
+        # --- Step 2: Handle TP shard slicing ---
+        # If the loaded weight is full (not yet sharded for this TP rank),
+        # slice the appropriate partition. ColumnParallelLinear shards along
+        # dim 0 (output dimension).
+        if w.dim() == 2:
+            # Compare against the module's actual parameter shape to decide
+            # whether slicing is needed. This avoids double-sharding when DCP
+            # has already loaded the correct TP shard.
+            expected_shape = self.proj.weight.shape  # [embed_dim // tp_size, input_size]
+            if w.shape == expected_shape:
+                logger.info(
+                    f"ParallelPatchEmbed: weight already matches module param "
+                    f"shape {list(expected_shape)}, skipping TP shard slicing."
+                )
+                return
+
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                shard_dim = self.embed_dim // tp_size
+                if w.shape[0] == self.embed_dim:
+                    # Full (unsharded) weight — slice for this TP rank.
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                    start = tp_rank * shard_dim
+                    end = start + shard_dim
+                    state_dict[weight_key] = w[start:end, :].contiguous()
+                    logger.info(
+                        f"ParallelPatchEmbed: sliced TP shard {tp_rank}/{tp_size} "
+                        f"from full weight [{self.embed_dim}, {w.shape[1]}] "
+                        f"-> [{shard_dim}, {w.shape[1]}]"
+                    )
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ):
+        """Custom sharded_state_dict that stores the weight in 4-D Conv2d layout.
+
+        This ensures backward-compatible DCP loading from old checkpoints that
+        stored the patch embedding as a Conv2d weight ``[O, C, H, W]``.
+
+        During **saving** (``build_fn``):
+          - The local 2-D TP-shard ``[O/tp, C*H*W]`` is reshaped to 4-D
+            ``[O/tp, C, H, W]`` and declared as TP-sharded along axis 0.
+          - The 4-D global shape ``[O, C, H, W]`` matches old checkpoints.
+
+        During **loading** (``merge_fn``):
+          - DCP loads the 4-D TP-shard ``[O/tp, C, H, W]`` (handling any
+            TP-size change via its resharding engine).
+          - ``merge_fn`` reshapes back to 2-D ``[O/tp, C*H*W]``.
+
+        The ``_extra_state`` from ``ColumnParallelLinear`` is forwarded as-is
+        so that newer checkpoints saved with TE extra-state can be loaded.
+        """
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+        weight = self.proj.weight  # local TP-shard: [embed_dim/tp, C*H*W]
+        C, H, W = self.in_channels, self.patch_size, self.patch_size
+
+        # ---- build_fn: reshape 2-D → 4-D and declare TP-sharded ShardedTensor ----
+        @torch.no_grad()
+        def _build_fn(
+            key: str,
+            tensor: torch.Tensor,
+            replica_id,
+            flattened_range: Optional[slice],
+        ):
+            # Non-flat local shape in 4-D for this TP rank
+            local_out = weight.shape[0]  # embed_dim // tp_size
+            non_flat_local_shape = (local_out, C, H, W)
+
+            if flattened_range is not None:
+                # Distributed optimizer with flattened parameters:
+                # `tensor` is already a 1-D slice of the flat optimizer state.
+                # We declare the non-flat 4-D shape so DCP can map it.
+                return [
+                    ShardedTensor.from_rank_offsets_flat(
+                        key,
+                        tensor,
+                        non_flat_local_shape,
+                        *sharded_offsets,
+                        (len(sharded_offsets), tp_rank, tp_size),
+                        replica_id=replica_id,
+                        prepend_axis_num=len(sharded_offsets),
+                        flattened_range=flattened_range,
+                    )
+                ]
+
+            # Normal (non-flat) case: reshape to 4-D for checkpoint compatibility
+            tensor_4d = tensor.reshape(non_flat_local_shape)
+            return [
+                ShardedTensor.from_rank_offsets(
+                    key,
+                    tensor_4d,
+                    *sharded_offsets,
+                    (len(sharded_offsets), tp_rank, tp_size),
+                    replica_id=(0, 0, dp_rank),
+                    prepend_axis_num=len(sharded_offsets),
+                )
+            ]
+
+        # ---- merge_fn: reshape loaded 4-D shard back to 2-D ----
+        @torch.no_grad()
+        def _merge_fn(sub_state_dict):
+            # sub_state_dict is a list of tensors returned by build_fn's ShardedTensors
+            # Typically a single 4-D tensor [O/tp, C, H, W]
+            if isinstance(sub_state_dict, list):
+                tensor_4d = torch.cat(sub_state_dict)
+            else:
+                tensor_4d = sub_state_dict
+            if tensor_4d.dim() == 4:
+                return tensor_4d.reshape(tensor_4d.shape[0], -1)
+            # Already 2-D or 1-D (flattened optimizer state) — return as-is
+            return tensor_4d
+
+        weight_key = f'{prefix}proj.weight'
+        sharded_state_dict = {
+            weight_key: ShardedTensorFactory(
+                key=weight_key,
+                data=weight,
+                build_fn=_build_fn,
+                merge_fn=_merge_fn,
+                replica_id=(0, 0, dp_rank),
+            ),
+        }
+
+        # Forward _extra_state if present (for TE compatibility)
+        extra_state = self.proj.get_extra_state()
+        extra_state_key = f'{prefix}proj._extra_state'
+        sharded_state_dict[extra_state_key] = make_sharded_object_for_checkpoint(
+            extra_state, extra_state_key, sharded_offsets
+        )
+
+        return sharded_state_dict
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to convert images to patch embeddings.
+
+        Args:
+            hidden_states (torch.Tensor): Input patches of shape
+                ``[total_patches, in_channels * patch_size * patch_size]``.
+
+        Returns:
+            torch.Tensor: Patch embeddings of shape ``[total_patches, embed_dim]``.
+        """
+        output, _ = self.proj(hidden_states)
+        return output
 
 
 class PatchEmbed(torch.nn.Module):
@@ -63,6 +319,185 @@ class PatchEmbed(torch.nn.Module):
         hidden_states = hidden_states.view(-1, self.in_channels, self.patch_size, self.patch_size)
         hidden_states = self.proj(hidden_states).view(-1, self.embed_dim)
         return hidden_states
+
+
+class TorchLinearPatchEmbed(torch.nn.Module):
+    """
+    Image to Patch Embedding module (plain torch.nn.Linear version, no TP).
+
+    Functionally identical to ``ParallelPatchEmbed`` except that it uses a
+    standard ``torch.nn.Linear`` instead of ``ColumnParallelLinear``, so
+    there is no tensor-parallel sharding.  This is useful for debugging or
+    for training configurations where TP is not needed for the patch embed.
+
+    Checkpoint compatibility:
+    - Loads old Conv2d weights ``[O, C, H, W]`` via a pre-hook (4D→2D reshape).
+    - Saves weights in Conv2d 4-D layout ``[O, C, H, W]`` via ``sharded_state_dict``
+      so that DCP checkpoints remain backward-compatible with ``PatchEmbed`` /
+      ``ParallelPatchEmbed`` checkpoints.
+
+    Args:
+        patch_size (int): Size of each square patch. Default: 14.
+        in_channels (int): Number of input image channels. Default: 3.
+        embed_dim (int): Dimension of patch embeddings. Default: 1024.
+    """
+
+    def __init__(
+        self,
+        patch_size: int = 14,
+        in_channels: int = 3,
+        embed_dim: int = 1024,
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+
+        linear_input_size = in_channels * patch_size * patch_size
+        self.proj = torch.nn.Linear(linear_input_size, embed_dim, bias=False)
+        torch.nn.init.xavier_uniform_(self.proj.weight)
+
+        # Register a pre-hook to handle old Conv2d checkpoint weights.
+        self._register_load_state_dict_pre_hook(self._conv2d_to_linear_hook)
+
+    def _conv2d_to_linear_hook(self, state_dict, prefix, *args, **kwargs):
+        """Reshape Conv2d weights to Linear (no TP slicing needed).
+
+        Detects 4-D Conv2d weights ``[O, C, H, W]`` and reshapes them to
+        ``[O, C*H*W]``.  Since there is no TP, no shard slicing is required.
+        """
+        weight_key = f"{prefix}proj.weight"
+        if weight_key not in state_dict:
+            return
+
+        w = state_dict[weight_key]
+
+        # Conv2d 4-D → Linear 2-D
+        if w.dim() == 4:
+            out_dim = w.shape[0]
+            w = w.reshape(out_dim, -1)
+            logger.info(
+                f"TorchLinearPatchEmbed: reshaped Conv2d weight from 4D to 2D: "
+                f"{list(state_dict[weight_key].shape)} -> {list(w.shape)}"
+            )
+            state_dict[weight_key] = w
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ):
+        """Custom sharded_state_dict that stores the weight in 4-D Conv2d layout.
+
+        Saves the weight as ``[O, C, H, W]`` (replicated, no TP axis) so that
+        DCP checkpoints are backward-compatible with old Conv2d checkpoints.
+
+        During **saving** (``build_fn``):
+          - The local 2-D weight ``[O, C*H*W]`` is reshaped to 4-D ``[O, C, H, W]``
+            and declared as fully replicated (``tp_size=1``).
+
+        During **loading** (``merge_fn``):
+          - DCP loads the 4-D tensor ``[O, C, H, W]`` and ``merge_fn`` reshapes
+            it back to 2-D ``[O, C*H*W]``.
+        """
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+        # Since TorchLinearPatchEmbed is not TP-sharded, the weight is replicated
+        # across all TP ranks.  Only tp_rank=0 is the "main replica" so that DCP
+        # validation counts exactly one writer per global shard.
+        replica_id = (tp_rank, 0, dp_rank)
+
+        weight = self.proj.weight  # [embed_dim, C*H*W]
+        C, H, W = self.in_channels, self.patch_size, self.patch_size
+
+        # ---- build_fn: reshape 2-D → 4-D and declare replicated ShardedTensor ----
+        @torch.no_grad()
+        def _build_fn(
+            key: str,
+            tensor: torch.Tensor,
+            _replica_id,
+            flattened_range: Optional[slice],
+        ):
+            non_flat_local_shape = (self.embed_dim, C, H, W)
+
+            if flattened_range is not None:
+                # Distributed optimizer with flattened parameters.
+                #
+                # TorchLinearPatchEmbed holds the *full* (non-TP-sharded) weight
+                # on every TP rank.  The weight is replicated, so the local
+                # non-flat shape is the FULL shape ``(embed_dim, C, H, W)``.
+                #
+                # The DistributedOptimizer assigns each rank (across TP and DP)
+                # a distinct ``flattened_range`` slice of the flat parameter
+                # buffer.  ALL TP ranks must participate — each owns a different
+                # slice of the optimizer state for this (replicated) weight.
+                #
+                # ``_replica_id`` is ``(tp_rank, 0, optimizer_instance_id)``
+                # as set by the DistributedOptimizer.  We pass it through so
+                # DCP can identify tp_rank > 0 copies as replicas of the
+                # tp_rank == 0 main copy.
+                return [
+                    ShardedTensor.from_rank_offsets_flat(
+                        key,
+                        tensor,
+                        non_flat_local_shape,
+                        *sharded_offsets,
+                        replica_id=_replica_id,
+                        prepend_axis_num=len(sharded_offsets),
+                        flattened_range=flattened_range,
+                    )
+                ]
+
+            # Normal case: reshape to 4-D for checkpoint compatibility
+            tensor_4d = tensor.reshape(non_flat_local_shape)
+            return [
+                ShardedTensor.from_rank_offsets(
+                    key,
+                    tensor_4d,
+                    *sharded_offsets,
+                    replica_id=replica_id,
+                    prepend_axis_num=len(sharded_offsets),
+                )
+            ]
+
+        # ---- merge_fn: reshape loaded 4-D shard back to 2-D ----
+        @torch.no_grad()
+        def _merge_fn(sub_state_dict):
+            if isinstance(sub_state_dict, list):
+                tensor_4d = torch.cat(sub_state_dict)
+            else:
+                tensor_4d = sub_state_dict
+            if tensor_4d.dim() == 4:
+                return tensor_4d.reshape(tensor_4d.shape[0], -1)
+            return tensor_4d
+
+        weight_key = f'{prefix}proj.weight'
+        sharded_state_dict = {
+            weight_key: ShardedTensorFactory(
+                key=weight_key,
+                data=weight,
+                build_fn=_build_fn,
+                merge_fn=_merge_fn,
+                replica_id=replica_id,
+            ),
+        }
+
+        return sharded_state_dict
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to convert images to patch embeddings.
+
+        Args:
+            hidden_states (torch.Tensor): Input patches of shape
+                ``[total_patches, in_channels * patch_size * patch_size]``.
+
+        Returns:
+            torch.Tensor: Patch embeddings of shape ``[total_patches, embed_dim]``.
+        """
+        return self.proj(hidden_states)
 
 
 class VideoRotaryEmbeddingSplit466(torch.nn.Module):
@@ -249,12 +684,59 @@ class OneVisionEncoderModel(VisionModule):
             rope_theta=10000.0,  # Default rope_theta for vision
         )
 
-        # Patch embedding module
-        self.patch_embed = PatchEmbed(
-            patch_size=config.patch_size,
-            in_channels=config.in_channels,
-            embed_dim=config.hidden_size,
-        )
+        patch_embed_type = os.environ.get("PATCH_EMBED_TYPE", "TP_LINEAR").upper()
+        _rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        if _rank0:
+            logger.info("using %s as patch embedding type", patch_embed_type)
+        if patch_embed_type == "TP_LINEAR":
+            self.patch_embed = ParallelPatchEmbed(
+                patch_size=config.patch_size,
+                in_channels=config.in_channels,
+                embed_dim=config.hidden_size,
+                config=config,
+            )
+            if TE_EXTRA_STATE_CHECK:
+                add_te_filter_module_and_op("vision_model", "patch_embed")
+                self.register_load_state_dict_post_hook(
+                    lambda module, incompatible_keys: _load_state_dict_hook_ignore_extra_state(
+                        module, incompatible_keys,
+                        modules_to_filter=["vision_model"],
+                        ops_to_filter=["patch_embed"]
+                    )
+                )
+        elif patch_embed_type == "LINEAR":
+            self.patch_embed = TorchLinearPatchEmbed(
+                patch_size=config.patch_size,
+                in_channels=config.in_channels,
+                embed_dim=config.hidden_size,
+            )
+        elif patch_embed_type == "CONV2D":
+            self.patch_embed = PatchEmbed(
+                patch_size=config.patch_size,
+                in_channels=config.in_channels,
+                embed_dim=config.hidden_size,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported PATCH_EMBED_TYPE={patch_embed_type!r}. "
+                "Supported values are: TP_LINEAR, LINEAR, CONV2D."
+            )
+        if _rank0:
+            logger.info("using patch_embed: %s", self.patch_embed)
+
+        if _SCATTER_BEFORE_PATCH_EMBED:
+            if isinstance(self.patch_embed, ParallelPatchEmbed):
+                raise RuntimeError(
+                    "SCATTER_BEFORE_PATCH_EMBED=1 is not compatible with ParallelPatchEmbed. "
+                    "ParallelPatchEmbed uses ColumnParallelLinear which already handles TP "
+                    "sharding internally (gather_output=True). Set PATCH_EMBED_TYPE=LINEAR "
+                    "or PATCH_EMBED_TYPE=CONV2D, or disable SCATTER_BEFORE_PATCH_EMBED."
+                )
+            if _rank0:
+                logger.info("SCATTER_BEFORE_PATCH_EMBED=1: scatter x before patch_embed")
+        else:
+            if _rank0:
+                logger.info("SCATTER_BEFORE_PATCH_EMBED=0: scatter after patch_embed (original path)")
 
         # Transformer decoder blocks
         self.decoder = TransformerBlock(
@@ -278,7 +760,6 @@ class OneVisionEncoderModel(VisionModule):
         if TE_EXTRA_STATE_CHECK:
             add_te_filter_module_and_op("vision_model", "pre_layernorm")
             
-            # Register hook to ignore missing _extra_state keys when loading old checkpoints
             self.register_load_state_dict_post_hook(
                 lambda module, incompatible_keys: _load_state_dict_hook_ignore_extra_state(
                     module, incompatible_keys, 
@@ -398,8 +879,31 @@ class OneVisionEncoderModel(VisionModule):
 
             grid_thw = torch.tensor(expanded_grid_thw, dtype=torch.int64, device=grid_thw.device)
 
-        # Convert patches to embeddings
-        x = self.patch_embed(x)
+        # Record original token count before any padding/scatter.
+        total_tokens = x.shape[0]
+        sp_pad_size = 0
+
+        if _SCATTER_BEFORE_PATCH_EMBED:
+            # ── Optimized path ──────────────────────────────────────────
+            # Scatter x along the token dimension BEFORE patch_embed so that
+            # each TP rank only processes 1/tp of the tokens through the
+            # embedding layer.  RoPE and cu_seqlens remain replicated (not
+            # scattered) because the packed-sequence attention kernel on each
+            # rank needs the complete sequence metadata.
+            if self.config.sequence_parallel:
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                sp_pad_size = (tp_size - total_tokens % tp_size) % tp_size
+                if sp_pad_size > 0:
+                    x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad_size))
+                x = tensor_parallel.scatter_to_sequence_parallel_region(x)
+
+            # Convert patches to embeddings (now only s/tp tokens per rank).
+            x = self.patch_embed(x)
+        else:
+            # ── Original path ───────────────────────────────────────────
+            # Convert ALL patches to embeddings on every rank, then scatter
+            # after RoPE + cu_seqlens are built.
+            x = self.patch_embed(x)
 
         batch_size = grid_thw.size(0)
         seq_len, hidden_dim = x.size()
@@ -464,24 +968,31 @@ class OneVisionEncoderModel(VisionModule):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
 
-        # Add sequence dimension:  [s, h] -> [s, 1, h]
-        x = x[:, None, :].contiguous()
+        if _SCATTER_BEFORE_PATCH_EMBED:
+            # ── Optimized path (continued) ──────────────────────────────
+            # Pad rotary_pos_emb and cu_seqlens for sequence parallelism.
+            # Unlike x (which was already scattered), RoPE and cu_seqlens remain
+            # replicated across all ranks so that the packed-sequence attention
+            # kernel can access the complete sequence metadata.
+            if self.config.sequence_parallel and sp_pad_size > 0:
+                rotary_pos_emb = torch.nn.functional.pad(rotary_pos_emb, (0, 0, 0, sp_pad_size))
+                cu_seqlens = torch.cat([cu_seqlens, cu_seqlens[-1:] + sp_pad_size])
 
-        # Pad and scatter for sequence parallel.  The TransformerBlock's
-        # TELayerNormColumnParallelLinear layers expect the input to be
-        # pre-scattered along the token (first) dimension; they all-gather
-        # before QKV/MLP projection.  Scattering here (before pre_layernorm)
-        # avoids an unnecessary full-sequence all-gather at the start of the
-        # first decoder layer, since LayerNorm normalises each token
-        # independently (over the hidden dimension) and gives the same result
-        # whether applied to the full sequence or to a local shard.
-        # cu_seqlens and rotary_pos_emb are padded to the next TP-size multiple
-        # and replicated across all ranks (not scattered), so that the packed-
-        # sequence attention kernel on each rank can access the complete sequence
-        # metadata.
-        x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size = self._scatter_for_sequence_parallel(
-            x, rotary_pos_emb, cu_seqlens
-        )
+            # Add sequence dimension:  [s/tp, h] -> [s/tp, 1, h]
+            x = x[:, None, :].contiguous()
+        else:
+            # ── Original path (continued) ───────────────────────────────
+            # Add sequence dimension:  [s, h] -> [s, 1, h]
+            x = x[:, None, :].contiguous()
+
+            # Pad and scatter for sequence parallel.  The TransformerBlock's
+            # TELayerNormColumnParallelLinear layers expect the input to be
+            # pre-scattered along the token (first) dimension.
+            # cu_seqlens and rotary_pos_emb are padded to the next TP-size
+            # multiple and replicated across all ranks (not scattered).
+            x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size = (
+                self._scatter_for_sequence_parallel(x, rotary_pos_emb, cu_seqlens)
+            )
 
         # Apply pre-layer normalization on the local (possibly scattered) shard.
         # Because LayerNorm normalises over the hidden dimension only (per token),
@@ -567,9 +1078,26 @@ class OneVisionEncoderModel(VisionModule):
         output["input_pixel_values"] = x.clone()
         output["input_grid_thw"] = grid_thw.clone()
 
-        # Convert patches to embeddings
-        x = self.patch_embed(x)
-        output["after_patch_embed"] = x.clone()
+        # Record original token count before any padding/scatter.
+        total_tokens = x.shape[0]
+        sp_pad_size = 0
+
+        if _SCATTER_BEFORE_PATCH_EMBED:
+            # ── Optimized path (mirrors forward()) ──────────────────────
+            if self.config.sequence_parallel:
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                sp_pad_size = (tp_size - total_tokens % tp_size) % tp_size
+                if sp_pad_size > 0:
+                    x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad_size))
+                x = tensor_parallel.scatter_to_sequence_parallel_region(x)
+
+            # Convert patches to embeddings (now only s/tp tokens per rank).
+            x = self.patch_embed(x)
+            output["after_patch_embed"] = x.clone()
+        else:
+            # ── Original path ───────────────────────────────────────────
+            x = self.patch_embed(x)
+            output["after_patch_embed"] = x.clone()
 
         batch_size = grid_thw.size(0)
         seq_len, hidden_dim = x.size()
@@ -606,51 +1134,12 @@ class OneVisionEncoderModel(VisionModule):
             # Use forward_from_positions method
             rotary_pos_emb = self.video_rope.forward_from_positions(patch_positions)
 
-            # Check if we need conversion or if positions were already for block layout
-            # Assuming positions are row-major like in HF, so we need layout conversion
-            # The convert_rope_to_block_layout_by_positions handles this more generically
-            # but here we follow mcore pattern.
-            # If positions are used, we assume they map to tokens.
-            # But the mcore implementation above uses convert_rope_to_block_layout on freqs.
-
-            # For consistency with how HF side generates/uses patch_positions:
-            # HF side uses convert_rope_to_block_layout_by_positions(freqs_visible, patch_positions...)
-
-            # Since mcore implementation might not have forward_from_positions or block layout by positions util readily available/imported here,
-            # we will stick to the grid_thw generation if patch_positions is not explicitly handled by video_rope class or util
-            # But wait, the user's error says OneVisionEncoderModel.forward_debug() got unexpected keyword argument.
-            # So the primary fix is just accepting the argument.
-
-            # Since I cannot easily see/import the utils here without more context,
-            # and the logic above for grid_thw is robust:
-            # I will accept the argument but prioritize using it IF implemented,
-            # otherwise fall back to grid_thw logic which produces identical results for regular grids.
-
-            # To be safe and minimal: just IGNORE patch_positions if we can't easily use it,
-            # or replicate the logic.
-            # MCore implementation seems to rely on grid_thw for reconstruction.
-
-            # Let's inspect tokens_per_sample calculation again
+            # Compute tokens_per_sample from grid_thw for cu_seqlens
             tokens_per_sample = []
             for i in range(batch_size):
                 t, h, w = grid_thw[i]
                 t, h, w = t.item(), h.item(), w.item()
                 tokens_per_sample.append(t * h * w)
-
-            # Re-calculating rotary_pos_emb using grid_thw as before is safe because
-            # patch_positions passed from check script is derived from grid_thw anyway.
-
-            all_rotary_pos_emb = []
-            for i in range(batch_size):
-                t, h, w = grid_thw[i]
-                t, h, w = t.item(), h.item(), w.item()
-
-                # Generate RoPE in row-major order (original 1x1 layout)
-                sample_freqs = self.video_rope(t=t, h=h, w=w, device=x.device)
-                sample_freqs = convert_rope_to_block_layout(sample_freqs, t, h, w, sms)
-                all_rotary_pos_emb.append(sample_freqs)
-
-            rotary_pos_emb = torch.cat(all_rotary_pos_emb, dim=0)
 
         output["rotary_pos_emb"] = rotary_pos_emb.clone()
 
@@ -670,17 +1159,25 @@ class OneVisionEncoderModel(VisionModule):
         )
         output["cu_seqlens"] = cu_seqlens.clone()
 
-        # Add sequence dimension
-        x = x[:, None, :].contiguous()  # [s, h] -> [s, 1, h]
-        output["before_pre_layernorm"] = x.clone()
+        if _SCATTER_BEFORE_PATCH_EMBED:
+            # ── Optimized path (continued) ──────────────────────────────
+            if self.config.sequence_parallel and sp_pad_size > 0:
+                rotary_pos_emb = torch.nn.functional.pad(rotary_pos_emb, (0, 0, 0, sp_pad_size))
+                cu_seqlens = torch.cat([cu_seqlens, cu_seqlens[-1:] + sp_pad_size])
 
-        # Pad and scatter for sequence parallel (mirrors forward()).
-        # Scatter before pre_layernorm so the decoder's first
-        # TELayerNormColumnParallelLinear receives already-scattered input and
-        # does not need to immediately all-gather what was just scattered.
-        x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size = self._scatter_for_sequence_parallel(
-            x, rotary_pos_emb, cu_seqlens
-        )
+            # Add sequence dimension
+            x = x[:, None, :].contiguous()  # [s/tp, h] -> [s/tp, 1, h]
+            output["before_pre_layernorm"] = x.clone()
+        else:
+            # ── Original path (continued) ───────────────────────────────
+            # Add sequence dimension
+            x = x[:, None, :].contiguous()  # [s, h] -> [s, 1, h]
+            output["before_pre_layernorm"] = x.clone()
+
+            # Pad and scatter for sequence parallel (mirrors forward()).
+            x, rotary_pos_emb, cu_seqlens, total_tokens, sp_pad_size = (
+                self._scatter_for_sequence_parallel(x, rotary_pos_emb, cu_seqlens)
+            )
 
         # Apply pre-layer normalization on the (possibly scattered) local shard.
         x = self.pre_layernorm(x)
