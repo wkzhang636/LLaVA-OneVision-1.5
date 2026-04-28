@@ -361,8 +361,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         max_lengths = torch.tensor([[0]], dtype=torch.int32)
 
         if self.is_packing_enabled or int(os.environ.get("OFFLINE_PACKED_DATA", 0)) == 1:
-            cu_lengths = torch.stack([s.cu_lengths for s in samples])
-            max_lengths = torch.tensor([s.max_length for s in samples], dtype=torch.int32)
+            cu_lengths = torch.stack([
+                getattr(s, "cu_lengths", torch.tensor([0, len(s.tokens)], dtype=torch.int32))
+                for s in samples
+            ])
+            max_lengths = torch.tensor([getattr(s, "max_length", len(s.tokens)) for s in samples], dtype=torch.int32)
 
         return ImageTaskBatchPacked(
             __key__=[s.__key__ for s in samples],

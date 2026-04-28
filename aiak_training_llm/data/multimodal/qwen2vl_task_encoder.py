@@ -1,13 +1,14 @@
 """Qwen2VLTaskEncoder class."""
 
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional, TypeVar, Union
 
 import numpy as np
 import torch
-from megatron.energon import CaptioningSample, VQASample
+from megatron.energon import CaptioningSample, SkipSample, VQASample
 from megatron.energon.flavors.base_dataset import (
     BaseCoreDatasetFactory,
     SavableDataset,
@@ -52,6 +53,23 @@ VIDEO_TOKEN = "<|video_pad|>"
 VISION_TAGS = ["<|vision_start|>", "<|vision_end|>"]
 IMAGE_TOKEN_WITH_TAGS = VISION_TAGS[0] + IMAGE_TOKEN + VISION_TAGS[1]
 VIDEO_TOKEN_WITH_TAGS = VISION_TAGS[0] + VIDEO_TOKEN + VISION_TAGS[1]
+SKIP_LOG_LIMIT = 5
+_SKIP_LOG_COUNTS: dict[str, int] = {}
+
+
+def skip_malformed_multimodal_sample(sample_key: str, signature: str, detail: str) -> None:
+    count = _SKIP_LOG_COUNTS.get(signature, 0) + 1
+    _SKIP_LOG_COUNTS[signature] = count
+
+    if count <= SKIP_LOG_LIMIT:
+        print(f"Skipping malformed multimodal sample {sample_key}: {detail}", file=sys.stderr)
+        if count == SKIP_LOG_LIMIT:
+            print(
+                f"Further '{signature}' skip logs will be suppressed for this worker.",
+                file=sys.stderr,
+            )
+
+    raise SkipSample(f"{sample_key}: {detail}")
 
 
 def get_stateless(fn: Callable[..., T_sample]) -> bool:
@@ -158,6 +176,32 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         self.min_pixels = args.min_pixels
         self.max_pixels = args.max_pixels
 
+    def _normalize_image_backed_video_placeholders(
+        self,
+        messages: list[dict[str, str]],
+        image: list | None,
+        video: list | None,
+    ) -> list[dict[str, str]]:
+        """Rewrite image-backed <video> placeholders into image placeholders."""
+        has_images = image is not None and len(image) > 0
+        has_video = video is not None and (
+            (isinstance(video, list) and len(video) > 0) or (not isinstance(video, list))
+        )
+
+        if not has_images or has_video:
+            return messages
+
+        video_placeholder_count = sum(msg.get("content", "").count(constants.Placeholder.VIDEO) for msg in messages)
+        if video_placeholder_count == 0:
+            return messages
+
+        image_block = "\n".join([constants.Placeholder.IMAGE] * len(image))
+        for msg in messages:
+            if constants.Placeholder.VIDEO in msg.get("content", ""):
+                msg["content"] = msg["content"].replace(constants.Placeholder.VIDEO, image_block)
+
+        return messages
+
     def _resize_image(self, image, size_factor=28):
         resized_height, resized_width = smart_resize(
             image.height,
@@ -231,8 +275,8 @@ class Qwen2VLTaskEncoder(TaskEncoder):
 
         return timestamps
 
-    @staticmethod
     def _rewrap_vision_by_frame(
+        self,
         messages: list[dict],
         patch_positions: list[torch.Tensor],
         timestamp_strings: list[str],
@@ -455,7 +499,12 @@ class Qwen2VLTaskEncoder(TaskEncoder):
 
         num_tiles = [len(image_grid_thw)]
         if self.args.enable_discard_sample:
-            assert len(input_ids) <= self.args.seq_length, f"{sample.__key__} input length {len(input_ids)}"
+            if len(input_ids) > self.args.seq_length:
+                skip_malformed_multimodal_sample(
+                    sample.__key__,
+                    "input_length_exceeds_seq_length",
+                    f"input length {len(input_ids)} exceeds seq_length={self.args.seq_length}",
+                )
         else:
             assert image_grid_thw.prod() / 4 <= self.args.seq_length, f"{sample.__key__} grid_thw: {image_grid_thw}"
 
@@ -483,7 +532,12 @@ class Qwen2VLTaskEncoder(TaskEncoder):
             raise NotImplementedError(f"Unknown training phase {self.args.training_phase}")
 
         if self.args.enable_discard_sample:
-            assert len(input_ids) <= self.args.seq_length, f"{sample.__key__} input length {len(input_ids)}"
+            if len(input_ids) > self.args.seq_length:
+                skip_malformed_multimodal_sample(
+                    sample.__key__,
+                    "input_length_exceeds_seq_length",
+                    f"input length {len(input_ids)} exceeds seq_length={self.args.seq_length}",
+                )
         else:
             assert video_grid_thw.prod(dim=-1).sum() / 4 <= self.args.seq_length, (
                 f"{sample.__key__} grid_thw: {video_grid_thw}"
@@ -537,7 +591,11 @@ class Qwen2VLTaskEncoder(TaskEncoder):
 
                 return messages[:user_idx] + messages[assistant_idx + 1 :]
 
-            current_messages = [dict(message) for message in sample.messages]
+            current_messages = self._normalize_image_backed_video_placeholders(
+                [dict(message) for message in sample.messages],
+                sample.image,
+                sample.video,
+            )
             current_image = sample.image
             current_video = sample.video
             current_patch_positions = sample.patch_positions
@@ -565,11 +623,21 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                     break
 
                 current_messages = _remove_last_qa_round(current_messages)
-                assert len(current_messages) > 0, (
-                    "Sample has no QA rounds left after truncation to fit seq_length:\n"
-                    f"- sample: {sample.__key__}\n"
-                    f"- seq_length: {self.args.seq_length}"
-                )
+                if len(current_messages) == 0:
+                    if self.args.enable_discard_sample:
+                        skip_malformed_multimodal_sample(
+                            sample.__key__,
+                            "qa_truncation_exhausted",
+                            (
+                                "sample has no QA rounds left after truncation "
+                                f"to fit seq_length={self.args.seq_length}"
+                            ),
+                        )
+                    raise AssertionError(
+                        "Sample has no QA rounds left after truncation to fit seq_length:\n"
+                        f"- sample: {sample.__key__}\n"
+                        f"- seq_length: {self.args.seq_length}"
+                    )
 
                 image_placeholder_count = sum(
                     message.get("content", "").count(constants.Placeholder.IMAGE) for message in current_messages
@@ -599,7 +667,12 @@ class Qwen2VLTaskEncoder(TaskEncoder):
         assert len(input_ids) > 0, f"input_ids is empty in {sample.__key__}"
 
         if self.args.enable_discard_sample:
-            assert len(input_ids) <= self.args.seq_length, f"{sample.__key__} input length {len(input_ids)}"
+            if len(input_ids) > self.args.seq_length:
+                skip_malformed_multimodal_sample(
+                    sample.__key__,
+                    "input_length_exceeds_seq_length",
+                    f"input length {len(input_ids)} exceeds seq_length={self.args.seq_length}",
+                )
         elif video_grid_thw is not None:
             assert video_grid_thw.prod(dim=-1).sum() / 4 <= self.args.seq_length, (
                 f"{sample.__key__} grid_thw: {video_grid_thw}"
