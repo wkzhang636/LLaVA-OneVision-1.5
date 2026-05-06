@@ -674,11 +674,13 @@ class Qwen2VLTaskEncoder(TaskEncoder):
                     f"input length {len(input_ids)} exceeds seq_length={self.args.seq_length}",
                 )
         elif video_grid_thw is not None:
-            assert video_grid_thw.prod(dim=-1).sum() / 4 <= self.args.seq_length, (
+            sms = getattr(self.processor.image_processor, "merge_size", 2)
+            assert video_grid_thw.prod(dim=-1).sum() / (sms * sms) <= self.args.seq_length, (
                 f"{sample.__key__} grid_thw: {video_grid_thw}"
             )
         elif image_grid_thw is not None:
-            image_token_len = int(image_grid_thw.prod(dim=-1).sum().item() / 4)
+            sms = getattr(self.processor.image_processor, "merge_size", 2)
+            image_token_len = int(image_grid_thw.prod(dim=-1).sum().item() / (sms * sms))
             assert image_token_len <= self.args.seq_length, (
                 "Image token length exceeds seq_length:\n"
                 f"- sample: {sample.__key__}\n"
