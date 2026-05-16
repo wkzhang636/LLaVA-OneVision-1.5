@@ -321,7 +321,7 @@ Thanks so much to all of our amazing contributors!
 
 ## Citation
 
-If you find *LLaVA-OneVision-1.5* useful in your research, please consider to cite the following related papers:
+If you find *LLaVA-OneVision-2.0* useful in your research, please consider to cite the following related papers:
 
 ```
 @inproceedings{LLaVA-OneVision-2.0,
@@ -348,7 +348,7 @@ If you find *LLaVA-OneVision-1.5* useful in your research, please consider to ci
 @article{lillava,
   title={LLaVA-OneVision: Easy Visual Task Transfer},
   author={Li, Bo and Zhang, Yuanhan and Guo, Dong and Zhang, Renrui and Li, Feng and Zhang, Hao and Zhang, Kaichen and Zhang, Peiyuan and Li, Yanwei and Liu, Ziwei and Li, Chunyuan},
-  journal={Transactions on Machine Learning Research}
+  journal={Transactions on Machine Learning Research},
   year={2024}
 }
 ```
