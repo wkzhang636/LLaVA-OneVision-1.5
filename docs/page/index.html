@@ -2804,7 +2804,7 @@
                 <span class="i18n" data-lang="en">Model Checkpoints</span><span class="i18n" data-lang="zh">模型权重</span>
               </h3>
               <div class="resource-items">
-                <a class="resource-item" href="https://huggingface.co/collections/mvp-lab/llava-onevision-2" target="_blank" rel="noopener noreferrer"><div class="resource-top">LLaVA-OneVision-2-8B<span class="resource-badge">HF</span></div><div class="resource-meta"><span class="i18n" data-lang="en">Pretrained checkpoints on HuggingFace.</span><span class="i18n" data-lang="zh">HuggingFace 上的预训练权重。</span></div></a>
+                <a class="resource-item" href="https://huggingface.co/lmms-lab-encoder/LLaVA-OneVision-2-8B-Instruct" target="_blank" rel="noopener noreferrer"><div class="resource-top">LLaVA-OneVision-2-8B-Instruct<span class="resource-badge">HF</span></div><div class="resource-meta"><span class="i18n" data-lang="en">Pretrained checkpoints on HuggingFace.</span><span class="i18n" data-lang="zh">HuggingFace 上的预训练权重。</span></div></a>
               </div>
             </div>
             <div class="resource-group wide">
@@ -2812,7 +2812,7 @@
                 <span class="i18n" data-lang="en">Training Datasets</span><span class="i18n" data-lang="zh">训练数据集</span>
               </h3>
               <div class="resource-items">
-                 <a class="resource-item" href="https://huggingface.co/collections/mvp-lab/llava-onevision-2" target="_blank" rel="noopener noreferrer"><div class="resource-top">LLaVA-OneVision-2-Data<span class="resource-badge">Dataset</span></div><div class="resource-meta"><span class="i18n" data-lang="en">Pretraining + instruction data.</span><span class="i18n" data-lang="zh">预训练 + 指令数据。</span></div></a>
+                 <a class="resource-item" href="https://huggingface.co/datasets/mvp-lab/LLaVA-OneVision-2-Data" target="_blank" rel="noopener noreferrer"><div class="resource-top">LLaVA-OneVision-2-Data<span class="resource-badge">Dataset</span></div><div class="resource-meta"><span class="i18n" data-lang="en">Pretraining + instruction data.</span><span class="i18n" data-lang="zh">预训练 + 指令数据。</span></div></a>
               </div>
             </div>
           </div>
@@ -2833,7 +2833,7 @@
 <pre><code id="code-quickstart" class="language-python">import torch
 from transformers import AutoProcessor, AutoModelForVision2Seq
 
-model_id = "lmms-lab/LLaVA-OneVision-2-8B"  # TBD
+model_id = "lmms-lab-encoder/LLaVA-OneVision-2-8B-Instruct"
 processor = AutoProcessor.from_pretrained(model_id)
 model = AutoModelForVision2Seq.from_pretrained(
     model_id, torch_dtype=torch.bfloat16, device_map="auto"
