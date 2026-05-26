@@ -17,7 +17,7 @@ href="docs/page/assets/wechat.png">WeChat Group</a></b> 👈
 
 <p align="center">
 🤗 <b>2 <a href="#models">Models</a></b> · <b><a href="#datasets">Datasets</a></b> · <b><a
-href="https://github.com/anxiangsir/ov2_asset/blob/main/LLaVA_OneVision_2.pdf">Technical Report</a></b> · <b><a
+href="https://arxiv.org/pdf/2605.25979">Technical Report</a></b> · <b><a
 href="https://evolvinglmms-lab.github.io/LLaVA-OneVision-2/">HomePage</a></b> · <b><a
 href="https://huggingface.co/spaces/FeilongTang/OneVision-Encoder-Codec-View">Codec&nbsp;Playground</a></b> · <b><a
 href="https://discord.gg/PmdGHMFNP">Discord</a></b>
